@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets and local env
+.env
+.env.local
+
+# Vector store (regenerated locally)
+chroma_db/
+
+# Curated private KB (PDFs, exports, screenshots); keep structure via .gitkeep
+data/kb/
+
+# OS
+.DS_Store
