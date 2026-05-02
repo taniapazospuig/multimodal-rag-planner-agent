@@ -1,11 +1,15 @@
 httpx>=0.24.0
 
 langchain>=0.3
+langchain-text-splitters>=0.3
 langgraph>=0.2
 langchain-google-genai>=2.0
 langchain-ollama>=0.2
 
 chromadb>=0.5
+pypdf>=6.10.2
+pypdfium2>=4.30.0
+pytesseract>=0.3.13
 Pillow>=10.0
 torch>=2.2
 open-clip-torch>=2.24.0
