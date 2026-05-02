@@ -32,6 +32,23 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+def cleanup_handwritten_or_text(text: str) -> str:
+    """
+    Conservative cleanup for Operations Research handwritten GoodNotes pages.
+    Keep original meaning while reducing obvious OCR/PDF extraction artifacts.
+    """
+    cleaned = text
+    # Split obvious number/letter boundaries in formulas and mixed tokens.
+    cleaned = re.sub(r"([A-Za-z])(\d)", r"\1 \2", cleaned)
+    cleaned = re.sub(r"(\d)([A-Za-z])", r"\1 \2", cleaned)
+    # Normalize repeated punctuation artifacts.
+    cleaned = re.sub(r"([,;:.!?])\1{1,}", r"\1", cleaned)
+    # Normalize spacing around common math operators.
+    cleaned = re.sub(r"\s*([=+\-*/<>])\s*", r" \1 ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return normalize_text(cleaned)
+
+
 def choose_method(row: dict[str, str]) -> str:
     source_path = row["source_path"].lower()
     ext = os.path.splitext(source_path)[1]
@@ -215,6 +232,10 @@ def iter_records(row: dict[str, str]) -> Iterable[dict[str, str | None]]:
     if method in {"pdf_text", "pdf_text_then_ocr_fallback"}:
         text_pages, page_count = extract_pdf_pages(source_path)
         ocr_pages: dict[str, str] = {}
+        is_or_handwritten = (
+            row.get("course") == "operations-research"
+            and "handwritten-notes-goodnotes" in row.get("source_path", "").lower()
+        )
 
         # OCR for PDFs is currently disabled; keep fallback route available
         # in case methods are changed later.
@@ -230,6 +251,8 @@ def iter_records(row: dict[str, str]) -> Iterable[dict[str, str | None]]:
                 pdf_text = text_pages.get(unit_id, "")
                 ocr_text = ocr_pages.get(unit_id, "")
                 text = pdf_text or ocr_text
+                if text and is_or_handwritten:
+                    text = cleanup_handwritten_or_text(text)
                 if text:
                     yield emit_record(
                         row,
