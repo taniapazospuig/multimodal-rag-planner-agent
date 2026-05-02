@@ -298,7 +298,10 @@ def iter_records(row: dict[str, str]) -> Iterable[dict[str, str | None]]:
         caption = build_caption(row) if method == "ocr_plus_caption" else ""
         combined = normalize_text(f"{ocr_text}\n\n{caption}".strip())
         if not combined:
-            combined = normalize_text(f"Image file context: {source_path.name}. {caption}")
+            # Always attach row metadata on empty OCR; `caption` is blank for method "ocr".
+            combined = normalize_text(
+                f"Image file context: {source_path.name}. {build_caption(row)}"
+            )
         yield emit_record(row, method, "image_0001", combined, row["source_path"])
         return
 
