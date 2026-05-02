@@ -25,11 +25,6 @@ OUT_PATH = PROJECT_ROOT / "data/kb/01_processed/extracted/documents_extracted.js
 # Keep extraction output readable when parsing imperfect PDFs.
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 
-# OCR merge guards for GoodNotes/handwritten PDFs.
-MIN_NEW_OCR_TOKENS = 8
-MIN_OCR_NEW_TOKEN_RATIO = 0.25
-
-
 def normalize_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
@@ -37,34 +32,10 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
-def tokenize_for_overlap(text: str) -> set[str]:
-    return {tok for tok in re.findall(r"[a-z0-9]+", text.lower()) if len(tok) >= 2}
-
-
-def should_merge_ocr_with_pdf_text(pdf_text: str, ocr_text: str) -> bool:
-    """
-    Keep OCR only when it adds enough new tokens beyond native PDF text.
-    This suppresses duplicate/noisy OCR on pages where native text is already rich.
-    """
-    if not pdf_text or not ocr_text:
-        return bool(ocr_text)
-
-    pdf_tokens = tokenize_for_overlap(pdf_text)
-    ocr_tokens = tokenize_for_overlap(ocr_text)
-    if not ocr_tokens:
-        return False
-
-    new_tokens = ocr_tokens.difference(pdf_tokens)
-    new_token_count = len(new_tokens)
-    new_ratio = new_token_count / max(1, len(ocr_tokens))
-    return new_token_count >= MIN_NEW_OCR_TOKENS and new_ratio >= MIN_OCR_NEW_TOKEN_RATIO
-
-
 def choose_method(row: dict[str, str]) -> str:
     source_path = row["source_path"].lower()
     ext = os.path.splitext(source_path)[1]
     course = row["course"].lower()
-    modality = row["modality"].lower()
 
     if ext in {".md", ".txt"}:
         return "plain_text"
@@ -75,10 +46,8 @@ def choose_method(row: dict[str, str]) -> str:
     if ext == ".rtf":
         return "rtf_text"
     if ext == ".pdf":
-        if "handwritten" in source_path or "goodnotes" in source_path:
-            return "pdf_text_then_ocr_fallback"
-        if modality == "text+image":
-            return "pdf_text_then_ocr_fallback"
+        # PDF OCR intentionally disabled: GoodNotes exports already provide
+        # selectable native text, and extra OCR introduced duplicate/noisy text.
         return "pdf_text"
     if ext in {".png", ".jpg", ".jpeg", ".webp"}:
         if course in {"study-environment"}:
@@ -217,7 +186,6 @@ def iter_records(row: dict[str, str]) -> Iterable[dict[str, str | None]]:
     method = choose_method(row)
     source_path = PROJECT_ROOT / row["source_path"]
     ext = source_path.suffix.lower()
-    source_path_lc = row["source_path"].lower()
 
     if method in {"plain_text", "code_text"}:
         text = normalize_text(safe_read_text(source_path))
@@ -247,36 +215,21 @@ def iter_records(row: dict[str, str]) -> Iterable[dict[str, str | None]]:
     if method in {"pdf_text", "pdf_text_then_ocr_fallback"}:
         text_pages, page_count = extract_pdf_pages(source_path)
         ocr_pages: dict[str, str] = {}
-        force_full_ocr = "goodnotes" in source_path_lc or "handwritten" in source_path_lc
 
-        # Only do OCR fallback on PDFs when configured for it.
+        # OCR for PDFs is currently disabled; keep fallback route available
+        # in case methods are changed later.
         if method == "pdf_text_then_ocr_fallback":
             all_page_ids = {f"page_{idx:04d}" for idx in range(1, page_count + 1)}
-            if force_full_ocr:
-                # GoodNotes/handwritten PDFs often contain meaningful ink annotations
-                # that are not represented in native PDF text extraction.
-                ocr_pages = extract_pdf_page_ocr(source_path, all_page_ids)
-            else:
-                missing_page_ids = all_page_ids.difference(text_pages.keys())
-                if missing_page_ids:
-                    ocr_pages = extract_pdf_page_ocr(source_path, missing_page_ids)
+            missing_page_ids = all_page_ids.difference(text_pages.keys())
+            if missing_page_ids:
+                ocr_pages = extract_pdf_page_ocr(source_path, missing_page_ids)
 
         all_page_ids = sorted(set(text_pages) | set(ocr_pages))
         if all_page_ids:
             for unit_id in all_page_ids:
                 pdf_text = text_pages.get(unit_id, "")
                 ocr_text = ocr_pages.get(unit_id, "")
-                if force_full_ocr and pdf_text and ocr_text:
-                    if ocr_text in pdf_text:
-                        text = pdf_text
-                    elif pdf_text in ocr_text:
-                        text = ocr_text
-                    elif should_merge_ocr_with_pdf_text(pdf_text, ocr_text):
-                        text = normalize_text(f"{pdf_text}\n\n{ocr_text}")
-                    else:
-                        text = pdf_text
-                else:
-                    text = pdf_text or ocr_text
+                text = pdf_text or ocr_text
                 if text:
                     yield emit_record(
                         row,
