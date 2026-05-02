@@ -28,6 +28,21 @@ OUT_PATH = PROJECT_ROOT / "data/kb/01_processed/chunked/chunks_recursive.jsonl"
 SCHEMA_PATH = PROJECT_ROOT / "data/kb/01_processed/chunked/chunk_schema.json"
 
 SEPARATORS = ["\n\n", "\n", ". ", "; ", ": ", " ", ""]
+TECHNICAL_KEYWORDS = {
+    "attention",
+    "embedding",
+    "transformer",
+    "objective",
+    "constraint",
+    "optimization",
+    "algorithm",
+    "gradient",
+    "retrieval",
+    "rag",
+    "multimodal",
+    "indexing",
+    "loss",
+}
 
 
 def normalize_text(text: str) -> str:
@@ -70,6 +85,48 @@ def merge_small_chunks(chunks: list[str], min_keep_tokens: int) -> list[str]:
     return [c for c in merged if c]
 
 
+def _contains_technical_signal(text: str) -> bool:
+    low = text.lower()
+    return any(k in low for k in TECHNICAL_KEYWORDS)
+
+
+def _is_low_value_slide_title_chunk(row: dict, text: str, tokens: int) -> bool:
+    if str(row.get("resource_type", "")) != "annotated_lecture_slides":
+        return False
+    if tokens >= 30:
+        return False
+    if _contains_technical_signal(text):
+        return False
+    low = text.lower()
+    title_hints = (
+        "course overview",
+        "outline",
+        "thanks",
+        "questions",
+        "tentative syllabus",
+        "teaching team",
+        "what's new",
+        "what’s new",
+    )
+    if any(h in low for h in title_hints):
+        return True
+    # Conservative fallback for short title-like slide strings.
+    return text.count("\n") <= 2 and text.count(".") <= 1 and tokens < 20
+
+
+def postprocess_chunk_texts(row: dict, chunk_texts: list[str]) -> list[str]:
+    # Drop low-value tiny title chunks for annotated lecture slides.
+    out: list[str] = []
+    for text in chunk_texts:
+        tokens = estimate_tokens(text)
+        if _is_low_value_slide_title_chunk(row, text, tokens):
+            continue
+        normalized = normalize_text(text)
+        if normalized:
+            out.append(normalized)
+    return out
+
+
 def load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -98,6 +155,7 @@ def chunk_unit_text(
     target_tokens: int,
     overlap_tokens: int,
     min_keep_tokens: int,
+    row: dict,
 ) -> list[str]:
     try:
         from langchain_text_splitters import RecursiveCharacterTextSplitter  # type: ignore
@@ -117,7 +175,8 @@ def chunk_unit_text(
     split_chunks = splitter.split_text(normalize_text(text))
     cleaned = [normalize_text(c) for c in split_chunks if normalize_text(c)]
     merged = merge_small_chunks(cleaned, min_keep_tokens=min_keep_tokens)
-    return [c for c in merged if normalize_text(c)]
+    post = postprocess_chunk_texts(row=row, chunk_texts=merged)
+    return [c for c in post if normalize_text(c)]
 
 
 def write_schema(path: Path) -> None:
@@ -213,6 +272,7 @@ def main() -> None:
                 target_tokens=args.target_tokens,
                 overlap_tokens=args.overlap_tokens,
                 min_keep_tokens=args.min_keep_tokens,
+                row=row,
             )
             for idx, text in enumerate(chunk_texts):
                 text = normalize_text(text)
