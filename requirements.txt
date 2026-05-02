@@ -7,6 +7,7 @@ langchain-google-genai>=2.0
 langchain-ollama>=0.2
 
 chromadb>=0.5
+rank-bm25>=0.2.2
 pypdf>=6.10.2
 pypdfium2>=4.30.0
 pytesseract>=0.3.13
