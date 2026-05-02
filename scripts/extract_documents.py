@@ -295,7 +295,7 @@ def iter_records(row: dict[str, str]) -> Iterable[dict[str, str | None]]:
 
     if method in {"ocr", "ocr_plus_caption"} and ext in {".png", ".jpg", ".jpeg", ".webp"}:
         ocr_text = extract_image_ocr(source_path)
-        caption = build_caption(row) if method in {"ocr", "ocr_plus_caption"} else ""
+        caption = build_caption(row) if method == "ocr_plus_caption" else ""
         combined = normalize_text(f"{ocr_text}\n\n{caption}".strip())
         if not combined:
             combined = normalize_text(f"Image file context: {source_path.name}. {caption}")
