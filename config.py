@@ -1,4 +1,4 @@
-"""Load settings from environment (and optional `.env` via python-dotenv)."""
+"""Simple, readable runtime settings for the planner agent."""
 
 from __future__ import annotations
 
@@ -7,32 +7,58 @@ from dataclasses import dataclass
 from enum import Enum
 
 
+# Requested defaults:
+# - LLM: gemini-3.1-flash-lite-preview
+# - Embeddings: OpenCLIP ViT-B-32 + laion2b_s34b_b79k
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+DEFAULT_OPENCLIP_MODEL = "ViT-B-32"
+DEFAULT_OPENCLIP_PRETRAINED = "laion2b_s34b_b79k"
+
+
 class LLMBackend(str, Enum):
     GEMINI = "gemini"
     OLLAMA = "ollama"
 
 
 class RAGPipelineMode(str, Enum):
-    """Ablation arms for your study (retrieval vs understanding modalities)."""
-
-    TEXT_ONLY = "text_only"  # text index, text-only LLM
-    TEXT_RETRIEVAL_MLLM = "text_retrieval_mllm"  # text index, MLLM at read time
-    MULTIMODAL_RETRIEVAL_MLLM = "multimodal_retrieval_mllm"  # CLIP-aligned index + MLLM
+    TEXT_ONLY = "text_only"
+    TEXT_RETRIEVAL_MLLM = "text_retrieval_mllm"
+    MULTIMODAL_RETRIEVAL_MLLM = "multimodal_retrieval_mllm"
 
 
 @dataclass(frozen=True)
 class Settings:
+    # LLM
     llm_backend: LLMBackend
     gemini_model: str
     gemini_api_key: str | None
+
+    # Kept for compatibility with planner_agent's optional Ollama branch.
     ollama_base_url: str
     ollama_model: str
+
+    # Retrieval
     rag_mode: RAGPipelineMode
     open_clip_model: str
     open_clip_pretrained: str
+    text_collection_name: str
+    text_bm25_path: str
+    text_context_mode: str
+    dense_k: int
+    bm25_k: int
+    hybrid_k: int
+    rrf_k: int
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int((os.environ.get(name) or str(default)).strip()))
+    except ValueError:
+        return default
 
 
 def load_settings() -> Settings:
+    """Load settings from `.env` + environment with sane defaults."""
     try:
         from dotenv import load_dotenv
 
@@ -40,28 +66,31 @@ def load_settings() -> Settings:
     except ImportError:
         pass
 
-    backend_raw = (os.environ.get("PLANNER_LLM_BACKEND") or "gemini").strip().lower()
-    backend = LLMBackend.GEMINI if backend_raw != "ollama" else LLMBackend.OLLAMA
-
     mode_raw = (os.environ.get("PLANNER_RAG_MODE") or RAGPipelineMode.TEXT_RETRIEVAL_MLLM.value).strip().lower()
-    try:
-        rag_mode = RAGPipelineMode(mode_raw)
-    except ValueError:
-        rag_mode = RAGPipelineMode.TEXT_RETRIEVAL_MLLM
+    rag_mode = (
+        RAGPipelineMode(mode_raw)
+        if mode_raw in {m.value for m in RAGPipelineMode}
+        else RAGPipelineMode.TEXT_RETRIEVAL_MLLM
+    )
 
-    gemini_key = (
-        os.environ.get("GOOGLE_API_KEY")
-        or os.environ.get("GEMINI_API_KEY")
-        or ""
-    ).strip() or None
+    text_context_mode = (os.environ.get("TEXT_CONTEXT_MODE") or "metadata").strip().lower()
+    if text_context_mode not in {"none", "metadata"}:
+        text_context_mode = "metadata"
 
     return Settings(
-        llm_backend=backend,
-        gemini_model=(os.environ.get("GEMINI_MODEL") or "gemini-2.0-flash").strip(),
-        gemini_api_key=gemini_key,
+        llm_backend=LLMBackend.GEMINI,
+        gemini_model=(os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip(),
+        gemini_api_key=(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip() or None,
         ollama_base_url=(os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/"),
         ollama_model=(os.environ.get("OLLAMA_MODEL") or "llava-phi3:3.8b").strip(),
         rag_mode=rag_mode,
-        open_clip_model=(os.environ.get("OPEN_CLIP_MODEL") or "ViT-B-32").strip(),
-        open_clip_pretrained=(os.environ.get("OPEN_CLIP_PRETRAINED") or "laion2b_s34b_b79k").strip(),
+        open_clip_model=(os.environ.get("OPEN_CLIP_MODEL") or DEFAULT_OPENCLIP_MODEL).strip(),
+        open_clip_pretrained=(os.environ.get("OPEN_CLIP_PRETRAINED") or DEFAULT_OPENCLIP_PRETRAINED).strip(),
+        text_collection_name=(os.environ.get("TEXT_COLLECTION_NAME") or "text_chunks").strip(),
+        text_bm25_path=(os.environ.get("TEXT_BM25_PATH") or "data/kb/02_index/bm25_corpus.jsonl").strip(),
+        text_context_mode=text_context_mode,
+        dense_k=_int_env("TEXT_DENSE_K", 12),
+        bm25_k=_int_env("TEXT_BM25_K", 12),
+        hybrid_k=_int_env("TEXT_HYBRID_K", 6),
+        rrf_k=_int_env("TEXT_RRF_K", 60),
     )
