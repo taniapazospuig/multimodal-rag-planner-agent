@@ -52,7 +52,7 @@ def cleanup_handwritten_or_text(text: str) -> str:
 def choose_method(row: dict[str, str]) -> str:
     source_path = row["source_path"].lower()
     ext = os.path.splitext(source_path)[1]
-    course = row["course"].lower()
+    course = row.get("course", "").lower()
 
     if ext in {".md", ".txt"}:
         return "plain_text"
@@ -67,11 +67,9 @@ def choose_method(row: dict[str, str]) -> str:
         # and add noisy layers that hurt retrieval.
         return "pdf_text"
     if ext in {".png", ".jpg", ".jpeg", ".webp"}:
-        if course in {"study-environment"}:
-            return "ocr_plus_caption"
-        if course in {"personal-planner", "personal-todo"}:
-            return "ocr"
-        return "ocr_plus_caption"
+        if course == "study-environment":
+            return "image_no_ocr"
+        return "ocr"
     return "plain_text"
 
 
@@ -133,15 +131,6 @@ def extract_image_ocr(path: Path) -> str:
         return normalize_text(text)
     except Exception:
         return ""
-
-
-def build_caption(row: dict[str, str]) -> str:
-    title = row.get("title", "").strip() or "untitled"
-    return (
-        f"Image context: {title}. "
-        f"Course/group: {row.get('course', '')}. Week: {row.get('week', '')}. "
-        f"Resource type: {row.get('resource_type', '')}."
-    )
 
 
 def emit_record(
@@ -223,16 +212,16 @@ def iter_records(row: dict[str, str]) -> Iterable[dict[str, str | None]]:
             yield emit_record(row, method, "page_0001", fallback_text, f"{row['source_path']}#page_0001")
         return
 
-    if method in {"ocr", "ocr_plus_caption"} and ext in {".png", ".jpg", ".jpeg", ".webp"}:
+    if method == "ocr" and ext in {".png", ".jpg", ".jpeg", ".webp"}:
         ocr_text = extract_image_ocr(source_path)
-        caption = build_caption(row) if method == "ocr_plus_caption" else ""
-        combined = normalize_text(f"{ocr_text}\n\n{caption}".strip())
+        combined = normalize_text(ocr_text)
         if not combined:
-            # Always attach row metadata on empty OCR; `caption` is blank for method "ocr".
-            combined = normalize_text(
-                f"Image file context: {source_path.name}. {build_caption(row)}"
-            )
+            combined = "[EMPTY_OCR_TEXT]"
         yield emit_record(row, method, "image_0001", combined, row["source_path"])
+        return
+
+    if method == "image_no_ocr" and ext in {".png", ".jpg", ".jpeg", ".webp"}:
+        yield emit_record(row, method, "image_0001", "[IMAGE_NO_OCR]", row["source_path"])
         return
 
     # Final fallback
