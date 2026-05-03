@@ -63,8 +63,8 @@ def choose_method(row: dict[str, str]) -> str:
     if ext == ".rtf":
         return "rtf_text"
     if ext == ".pdf":
-        # PDF OCR intentionally disabled: GoodNotes exports already provide
-        # selectable native text, and extra OCR introduced duplicate/noisy text.
+        # GoodNotes PDFs are exported with selectable text; OCR would duplicate it
+        # and add noisy layers that hurt retrieval.
         return "pdf_text"
     if ext in {".png", ".jpg", ".jpeg", ".webp"}:
         if course in {"study-environment"}:
@@ -120,40 +120,6 @@ def extract_pdf_pages(path: Path) -> tuple[dict[str, str], int]:
         if text:
             results[f"page_{idx:04d}"] = text
     return results, len(reader.pages)
-
-
-def extract_pdf_page_ocr(path: Path, target_page_ids: set[str] | None = None) -> dict[str, str]:
-    """
-    OCR each PDF page by rendering to an image first.
-    Returns a map: {unit_id -> ocr_text}
-    """
-    try:
-        import pypdfium2 as pdfium  # type: ignore
-        import pytesseract  # type: ignore
-    except Exception:
-        return {}
-
-    results: dict[str, str] = {}
-    try:
-        pdf = pdfium.PdfDocument(str(path))
-    except Exception:
-        return {}
-
-    for idx in range(len(pdf)):
-        unit_id = f"page_{idx + 1:04d}"
-        if target_page_ids is not None and unit_id not in target_page_ids:
-            continue
-        try:
-            page = pdf[idx]
-            # Scale 2.0 improves OCR readability without huge memory growth.
-            pil_image = page.render(scale=2.0).to_pil()
-            ocr_text = normalize_text(pytesseract.image_to_string(pil_image))
-            if ocr_text:
-                results[unit_id] = ocr_text
-        except Exception:
-            continue
-
-    return results
 
 
 def extract_image_ocr(path: Path) -> str:
@@ -229,28 +195,16 @@ def iter_records(row: dict[str, str]) -> Iterable[dict[str, str | None]]:
             yield emit_record(row, method, "cell_0000_unknown", "[EMPTY_NOTEBOOK]", None)
         return
 
-    if method in {"pdf_text", "pdf_text_then_ocr_fallback"}:
-        text_pages, page_count = extract_pdf_pages(source_path)
-        ocr_pages: dict[str, str] = {}
+    if method == "pdf_text":
+        text_pages, _ = extract_pdf_pages(source_path)
         is_or_handwritten = (
             row.get("course") == "operations-research"
             and "handwritten-notes-goodnotes" in row.get("source_path", "").lower()
         )
 
-        # OCR for PDFs is currently disabled; keep fallback route available
-        # in case methods are changed later.
-        if method == "pdf_text_then_ocr_fallback":
-            all_page_ids = {f"page_{idx:04d}" for idx in range(1, page_count + 1)}
-            missing_page_ids = all_page_ids.difference(text_pages.keys())
-            if missing_page_ids:
-                ocr_pages = extract_pdf_page_ocr(source_path, missing_page_ids)
-
-        all_page_ids = sorted(set(text_pages) | set(ocr_pages))
-        if all_page_ids:
-            for unit_id in all_page_ids:
-                pdf_text = text_pages.get(unit_id, "")
-                ocr_text = ocr_pages.get(unit_id, "")
-                text = pdf_text or ocr_text
+        if text_pages:
+            for unit_id in sorted(text_pages):
+                text = text_pages[unit_id]
                 if text and is_or_handwritten:
                     text = cleanup_handwritten_or_text(text)
                 if text:
