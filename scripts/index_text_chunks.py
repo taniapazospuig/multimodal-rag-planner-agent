@@ -10,17 +10,30 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
+import sys
 from pathlib import Path
 from typing import Iterable
 
+import chromadb  # type: ignore[import-not-found]
+import open_clip  # type: ignore[import-not-found]
+import torch
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from text_tokenization import LexicalTokenizerConfig, tokenize_for_bm25
+
 CHUNKS_PATH = PROJECT_ROOT / "data/kb/01_processed/chunked/chunks_recursive.jsonl"
 CHROMA_PATH = PROJECT_ROOT / "chroma_db"
 BM25_OUT_PATH = PROJECT_ROOT / "data/kb/02_index/bm25_corpus.jsonl"
 
 
 def load_jsonl(path: Path) -> list[dict]:
+    """Load a JSONL file into memory; one JSON object per non-empty line.
+
+    Returns an empty list if the file is missing.
+    """
     rows: list[dict] = []
     if not path.exists():
         return rows
@@ -33,11 +46,13 @@ def load_jsonl(path: Path) -> list[dict]:
 
 
 def batched(items: list[dict], batch_size: int) -> Iterable[list[dict]]:
+    """Yield consecutive slices of items, each at most batch_size long."""
     for i in range(0, len(items), batch_size):
         yield items[i : i + batch_size]
 
 
 def build_context_prefix(row: dict) -> str:
+    """Return a compact, deterministic tag line from chunk metadata (course, week, etc.)."""
     course = str(row.get("course", "unknown"))
     week = str(row.get("week", "unknown"))
     modality = str(row.get("modality", "unknown"))
@@ -50,18 +65,18 @@ def build_context_prefix(row: dict) -> str:
 
 
 def contextual_text(row: dict, context_mode: str) -> str:
+    """Return the string indexed for embedding/BM25: raw text, or text with a metadata prefix."""
     text = str(row.get("text", "")).strip()
     if context_mode == "none":
         return text
     if context_mode == "metadata":
-        # Lightweight contextualization inspired by contextual retrieval:
-        # prepend deterministic metadata so chunks keep local context.
         prefix = build_context_prefix(row)
         return f"{prefix}\n{text}".strip()
     raise ValueError(f"Unsupported context_mode: {context_mode}")
 
 
 def sanitize_metadata(row: dict, context_mode: str) -> dict:
+    """Keep only allowed keys for vector-store metadata; coerce types; store active context_mode."""
     allowed = {
         "chunk_id",
         "chunk_index",
@@ -90,25 +105,30 @@ def sanitize_metadata(row: dict, context_mode: str) -> dict:
     return out
 
 
-def simple_tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", text.lower())
-
-
-def write_bm25_corpus(path: Path, rows: list[dict], context_mode: str) -> None:
+def write_bm25_corpus(
+    path: Path,
+    rows: list[dict],
+    context_mode: str,
+    tokenizer_config: LexicalTokenizerConfig,
+) -> None:
+    """Write JSONL for BM25 using shared lexical preprocessing settings."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
             text = contextual_text(row, context_mode=context_mode)
+            metadata = sanitize_metadata(row, context_mode=context_mode)
+            metadata["lexical_tokenizer"] = tokenizer_config.to_dict()
             record = {
                 "chunk_id": str(row.get("chunk_id", "")),
                 "text": text,
-                "tokens": simple_tokenize(text),
-                "metadata": sanitize_metadata(row, context_mode=context_mode),
+                "tokens": tokenize_for_bm25(text, tokenizer_config),
+                "metadata": metadata,
             }
             f.write(json.dumps(record, ensure_ascii=True) + "\n")
 
 
 def main() -> None:
+    """Embed chunks with OpenCLIP, upsert into Chroma, then write the BM25 corpus file."""
     parser = argparse.ArgumentParser(description="Index chunked text into Chroma + BM25 corpus.")
     parser.add_argument("--chunks-path", type=Path, default=CHUNKS_PATH)
     parser.add_argument("--chroma-path", type=Path, default=CHROMA_PATH)
@@ -124,11 +144,23 @@ def main() -> None:
         choices=["none", "metadata"],
         help="How chunks are contextualized before embedding/BM25 indexing.",
     )
+    parser.add_argument(
+        "--disable-stopwords",
+        action="store_true",
+        help="Disable stopword removal in BM25 tokenization.",
+    )
+    parser.add_argument(
+        "--enable-stemming",
+        action="store_true",
+        help="Enable lightweight stemming in BM25 tokenization.",
+    )
     args = parser.parse_args()
-
-    import chromadb  # type: ignore[import-not-found]
-    import open_clip  # type: ignore[import-not-found]
-    import torch
+    tokenizer_config = LexicalTokenizerConfig(
+        lowercase=True,
+        strip_punctuation=True,
+        use_stopwords=not args.disable_stopwords,
+        use_stemming=args.enable_stemming,
+    )
 
     rows = load_jsonl(args.chunks_path)
     if not rows:
@@ -162,12 +194,18 @@ def main() -> None:
         )
         indexed += len(batch_rows)
 
-    write_bm25_corpus(args.bm25_out_path, rows, context_mode=args.context_mode)
+    write_bm25_corpus(
+        args.bm25_out_path,
+        rows,
+        context_mode=args.context_mode,
+        tokenizer_config=tokenizer_config,
+    )
 
     print(f"Indexed chunks: {indexed}")
     print(f"Chroma path: {args.chroma_path}")
     print(f"Collection: {args.collection}")
     print(f"Context mode: {args.context_mode}")
+    print(f"BM25 tokenizer: {tokenizer_config.to_dict()}")
     print(f"BM25 corpus: {args.bm25_out_path}")
 
 

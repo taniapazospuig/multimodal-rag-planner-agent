@@ -32,6 +32,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
 from config import RAGPipelineMode, Settings, load_settings
+from text_tokenization import LexicalTokenizerConfig, tokenize_for_bm25
 
 warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
 warnings.filterwarnings("ignore", category=FutureWarning, module="google")
@@ -169,8 +170,23 @@ def retrieve_context(query: str) -> str:
         image_hits = get_image_index().search(query, k=3)
         if image_hits:
             lines.append("Top image context (OpenCLIP image index):")
-            for i, (name, dist) in enumerate(image_hits, start=1):
-                lines.append(f"{i}. {name} (distance {dist:.3f})")
+            for i, hit in enumerate(image_hits, start=1):
+                dist = float(hit.get("distance", 0.0))
+                source_kind = str(hit.get("source_kind", "unknown"))
+                course = str(hit.get("course", "")).strip()
+                doc_id = str(hit.get("doc_id", "")).strip()
+                page_number = int(hit.get("page_number", 0) or 0)
+                rel_path = str(hit.get("relative_path", "")).strip()
+                filename = str(hit.get("filename", "?")).strip()
+
+                details = [f"source={source_kind}", f"path={rel_path or filename}"]
+                if course:
+                    details.append(f"course={course}")
+                if doc_id:
+                    details.append(f"doc_id={doc_id}")
+                if page_number > 0:
+                    details.append(f"page={page_number}")
+                lines.append(f"{i}. {filename} (distance {dist:.3f}) | " + " | ".join(details))
 
     return "\n".join(lines)
 
@@ -196,10 +212,6 @@ class OpenCLIPBackbone:
             tokens = self.tokenizer(texts).to(self.device)
             emb = self.model.encode_text(tokens).cpu().numpy().tolist()
         return emb
-
-
-def _simple_tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", text.lower())
 
 
 def _infer_slug_from_course_row(course: dict) -> str | None:
@@ -356,6 +368,7 @@ class HybridTextRetriever:
         self.bm25_rows: list[dict] = []
         self.by_id: dict[str, dict] = {}
         self.bm25 = None
+        self.lexical_tokenizer_config = LexicalTokenizerConfig()
         if bm25_path.exists():
             with bm25_path.open("r", encoding="utf-8") as f:
                 for line in f:
@@ -370,6 +383,12 @@ class HybridTextRetriever:
                     self.by_id[chunk_id] = row
 
             if self.bm25_rows:
+                first_meta = self.bm25_rows[0].get("metadata", {})
+                lexical_meta = first_meta.get("lexical_tokenizer") if isinstance(first_meta, dict) else None
+                self.lexical_tokenizer_config = LexicalTokenizerConfig.from_dict(
+                    lexical_meta if isinstance(lexical_meta, dict) else None,
+                    fallback=LexicalTokenizerConfig(),
+                )
                 corpus_tokens = [row.get("tokens", []) for row in self.bm25_rows]
                 self.bm25 = BM25Okapi(corpus_tokens)
 
@@ -390,7 +409,7 @@ class HybridTextRetriever:
     def _bm25_search(self, query: str, course_filter: str | None) -> list[str]:
         if self.bm25 is None or not self.bm25_rows:
             return []
-        tokens = _simple_tokenize(query)
+        tokens = tokenize_for_bm25(query, self.lexical_tokenizer_config)
         if not tokens:
             return []
         scores = self.bm25.get_scores(tokens)
@@ -474,11 +493,17 @@ def get_text_retriever() -> HybridTextRetriever:
 
 
 class ImageIndex:
-    """OpenCLIP image vectors in Chroma; text queries use the same CLIP text tower."""
+    """OpenCLIP image vectors in Chroma for manual and rendered PDF images."""
 
-    def __init__(self, settings: Settings, image_dir: str = "data/kb/images"):
+    def __init__(
+        self,
+        settings: Settings,
+        image_dir: str = "data/kb/images",
+        rendered_manifest_path: str = "data/kb/01_processed/rendered/pdf_pages_manifest.jsonl",
+    ):
         self.image_dir = _BASE_DIR / image_dir
         self.image_dir.mkdir(parents=True, exist_ok=True)
+        self.rendered_manifest_path = _BASE_DIR / rendered_manifest_path
 
         chroma_path = _BASE_DIR / "chroma_db"
         self.client = chromadb.PersistentClient(path=str(chroma_path))
@@ -495,50 +520,151 @@ class ImageIndex:
 
         self._index_new_images()
 
-    def _index_new_images(self) -> None:
+    @staticmethod
+    def _manual_image_id(path: Path) -> str:
+        # Keep ids stable across runs and robust to nested paths.
+        normalized = path.as_posix().replace("/", "__")
+        return f"img__{normalized}"
+
+    @staticmethod
+    def _pdf_render_id(row: dict[str, str]) -> str:
+        doc_id = str(row.get("doc_id", "")).strip()
+        unit_id = str(row.get("unit_id", "")).strip()
+        if doc_id and unit_id:
+            return f"pdf__{doc_id}__{unit_id}"
+        return ""
+
+    def _collect_manual_images(self, existing_ids: set[str]) -> tuple[list[Image.Image], list[str], list[dict]]:
         valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
-        files = [f for f in self.image_dir.iterdir() if f.suffix.lower() in valid_exts]
-        existing_ids = set(self.collection.get()["ids"] or [])
+        files = [f for f in self.image_dir.rglob("*") if f.is_file() and f.suffix.lower() in valid_exts]
 
-        new_images: list[Image.Image] = []
-        new_ids: list[str] = []
-        new_metas: list[dict] = []
-
+        images: list[Image.Image] = []
+        ids: list[str] = []
+        metas: list[dict] = []
         for path in files:
-            file_id = f"img_{path.name}"
-            if file_id in existing_ids:
+            image_id = self._manual_image_id(path.relative_to(_BASE_DIR))
+            if image_id in existing_ids:
                 continue
             try:
-                img = Image.open(path).convert("RGB")
-                new_images.append(img)
-                new_ids.append(file_id)
-                new_metas.append({"filename": path.name, "path": str(path)})
+                with Image.open(path) as opened:
+                    img = opened.convert("RGB")
             except Exception as e:
-                print(f"Skipping {path.name}: {e}")
+                print(f"Skipping {path}: {e}")
+                continue
+            images.append(img)
+            ids.append(image_id)
+            metas.append(
+                {
+                    "source_kind": "manual_image",
+                    "filename": path.name,
+                    "path": str(path),
+                    "relative_path": str(path.relative_to(_BASE_DIR).as_posix()),
+                }
+            )
+        return images, ids, metas
 
-        if not new_images:
+    def _collect_rendered_pdf_pages(self, existing_ids: set[str]) -> tuple[list[Image.Image], list[str], list[dict]]:
+        if not self.rendered_manifest_path.exists():
+            return [], [], []
+
+        images: list[Image.Image] = []
+        ids: list[str] = []
+        metas: list[dict] = []
+        with self.rendered_manifest_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                image_id = self._pdf_render_id(row)
+                if not image_id or image_id in existing_ids:
+                    continue
+
+                page_image_rel = str(row.get("page_image_path", "")).strip()
+                if not page_image_rel:
+                    continue
+                page_image_abs = _BASE_DIR / page_image_rel
+                if not page_image_abs.exists():
+                    continue
+
+                try:
+                    with Image.open(page_image_abs) as opened:
+                        img = opened.convert("RGB")
+                except Exception as e:
+                    print(f"Skipping {page_image_abs}: {e}")
+                    continue
+
+                images.append(img)
+                ids.append(image_id)
+                metas.append(
+                    {
+                        "source_kind": "pdf_render",
+                        "filename": page_image_abs.name,
+                        "path": str(page_image_abs),
+                        "relative_path": page_image_rel,
+                        "doc_id": str(row.get("doc_id", "")),
+                        "unit_id": str(row.get("unit_id", "")),
+                        "page_number": int(row.get("page_number", 0) or 0),
+                        "course": str(row.get("course", "")),
+                        "week": str(row.get("week", "")),
+                        "resource_type": str(row.get("resource_type", "")),
+                        "source_path": str(row.get("source_path", "")),
+                    }
+                )
+        return images, ids, metas
+
+    def _encode_and_add(self, images: list[Image.Image], ids: list[str], metas: list[dict]) -> None:
+        if not images:
             return
-
         with torch.no_grad():
             batch = torch.cat(
-                [self.preprocess(im).unsqueeze(0).to(self.device) for im in new_images],
+                [self.preprocess(im).unsqueeze(0).to(self.device) for im in images],
                 dim=0,
             )
             emb = self.model.encode_image(batch).cpu().numpy()
-        self.collection.add(embeddings=emb.tolist(), ids=new_ids, metadatas=new_metas)
+        self.collection.add(embeddings=emb.tolist(), ids=ids, metadatas=metas)
 
-    def search(self, query: str, k: int = 4) -> list[tuple[str, float]]:
+    def _index_new_images(self) -> None:
+        existing_ids = set(self.collection.get()["ids"] or [])
+        manual_images, manual_ids, manual_metas = self._collect_manual_images(existing_ids)
+        existing_ids.update(manual_ids)
+        pdf_images, pdf_ids, pdf_metas = self._collect_rendered_pdf_pages(existing_ids)
+
+        self._encode_and_add(manual_images, manual_ids, manual_metas)
+        self._encode_and_add(pdf_images, pdf_ids, pdf_metas)
+
+    def search(self, query: str, k: int = 4) -> list[dict]:
         with torch.no_grad():
             tokens = self.tokenizer([query]).to(self.device)
             q = self.model.encode_text(tokens).cpu().numpy()
 
         results = self.collection.query(query_embeddings=[q[0]], n_results=k)
-        out: list[tuple[str, float]] = []
+        out: list[dict] = []
         metas = (results.get("metadatas") or [[]])[0]
+        ids = (results.get("ids") or [[]])[0]
         dists = (results.get("distances") or [[]])[0]
-        for meta, dist in zip(metas, dists, strict=False):
-            if meta and "filename" in meta:
-                out.append((meta["filename"], float(dist)))
+        for image_id, meta, dist in zip(ids, metas, dists, strict=False):
+            meta = meta or {}
+            source_kind = str(meta.get("source_kind", "unknown"))
+            filename = str(meta.get("filename", image_id))
+            out.append(
+                {
+                    "id": image_id,
+                    "distance": float(dist),
+                    "source_kind": source_kind,
+                    "filename": filename,
+                    "relative_path": str(meta.get("relative_path", "")),
+                    "doc_id": str(meta.get("doc_id", "")),
+                    "unit_id": str(meta.get("unit_id", "")),
+                    "page_number": int(meta.get("page_number", 0) or 0),
+                    "course": str(meta.get("course", "")),
+                    "source_path": str(meta.get("source_path", "")),
+                }
+            )
         return out
 
 
@@ -561,10 +687,30 @@ def search_images(query: str) -> str:
     results = get_image_index().search(query, k=4)
     if not results:
         return (
-            "No indexed images. Drop files under `data/kb/images/` "
-            "(.jpg / .png / .webp) and retry."
+            "No indexed images. Add files under `data/kb/images/` or render PDF pages via:\n"
+            "python scripts/render_pdf_pages.py\n"
+            "Then retry."
         )
-    return "\n".join(f"{i+1}. {name} (distance {dist:.3f})" for i, (name, dist) in enumerate(results))
+    lines: list[str] = []
+    for i, hit in enumerate(results, start=1):
+        dist = float(hit.get("distance", 0.0))
+        source_kind = hit.get("source_kind", "unknown")
+        filename = hit.get("filename", "?")
+        rel_path = hit.get("relative_path", "")
+        doc_id = hit.get("doc_id", "")
+        page_number = int(hit.get("page_number", 0) or 0)
+        course = hit.get("course", "")
+
+        details = [f"source={source_kind}", f"path={rel_path or filename}"]
+        if doc_id:
+            details.append(f"doc_id={doc_id}")
+        if page_number > 0:
+            details.append(f"page={page_number}")
+        if course:
+            details.append(f"course={course}")
+
+        lines.append(f"{i}. {filename} (distance {dist:.3f}) | " + " | ".join(details))
+    return "\n".join(lines)
 
 
 TOOLS = [search_courses, retrieve_context, search_images]
