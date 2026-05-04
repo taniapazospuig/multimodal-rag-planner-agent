@@ -16,6 +16,11 @@ import json
 from pathlib import Path
 from typing import Iterable
 
+import chromadb  # type: ignore[import-not-found]
+import open_clip  # type: ignore[import-not-found]
+import torch
+from PIL import Image
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = PROJECT_ROOT / "data/kb/01_processed/rendered/pdf_pages_manifest.jsonl"
@@ -44,6 +49,7 @@ def batched(items: list[dict], batch_size: int) -> Iterable[list[dict]]:
 
 
 def to_image_id(row: dict) -> str:
+    """Generate a unique identifier for a rendered PDF page image."""
     doc_id = str(row.get("doc_id", "")).strip()
     unit_id = str(row.get("unit_id", "")).strip()
     if not doc_id or not unit_id:
@@ -52,6 +58,7 @@ def to_image_id(row: dict) -> str:
 
 
 def sanitize_metadata(row: dict) -> dict:
+    "Build image-specific metadata to support filtering"
     return {
         "source_kind": "pdf_render",
         "filename": Path(str(row.get("page_image_path", ""))).name,
@@ -84,11 +91,6 @@ def main() -> None:
         help="Delete and rebuild the collection before indexing.",
     )
     args = parser.parse_args()
-
-    import chromadb  # type: ignore[import-not-found]
-    import open_clip  # type: ignore[import-not-found]
-    import torch
-    from PIL import Image
 
     rows = load_jsonl(args.manifest_path)
     if not rows:
