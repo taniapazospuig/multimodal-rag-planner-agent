@@ -141,6 +141,7 @@ def retrieve_context(query: str) -> str:
     """Retrieve and rerank context for all ablation modes."""
     settings = get_settings()
     mode = settings.rag_mode
+    # Stage-1 text retrieval with a large candidate pool
     text_retriever = get_text_retriever()
     text_candidates = text_retriever.search(query, k=max(settings.hybrid_k, settings.text_rerank_top_n))
     if not text_candidates:
@@ -150,6 +151,7 @@ def retrieve_context(query: str) -> str:
             "Then retry your question."
         )
 
+    # Stage-2 text reranking with a local cross-encoder
     text_reranker = get_text_reranker()
     text_hits = text_reranker.rerank(query, text_candidates, top_k=settings.hybrid_k)
     text_reranker_mode = "disabled" if not settings.text_reranker_enabled else "cross-encoder"
@@ -175,6 +177,7 @@ def retrieve_context(query: str) -> str:
             f"   {text}"
         )
 
+    # If multimodal retrieval is enabled, perform visual reranking
     if mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM:
         image_candidates = get_image_index().search(query, k=max(3, settings.visual_rerank_top_n))
         image_hits = image_candidates[:3]
@@ -183,7 +186,7 @@ def retrieve_context(query: str) -> str:
 
         if image_hits:
             lines.append(
-                f"[visual reranker enabled={settings.visual_rerank_enabled} method=clip-similarity]"
+                f"[visual reranker enabled={settings.visual_rerank_enabled} model={settings.visual_reranker_model}]"
             )
             fused = _fuse_multimodal_hits(
                 text_hits=text_hits,
@@ -408,17 +411,6 @@ def _normalize_image_similarity(distance: float) -> float:
     return max(0.0, min(1.0, 1.0 - distance))
 
 
-def _keyword_overlap_score(query: str, text: str) -> float:
-    query_tokens = {t for t in re.findall(r"[a-z0-9]{3,}", query.lower())}
-    if not query_tokens:
-        return 0.0
-    text_tokens = {t for t in re.findall(r"[a-z0-9]{3,}", text.lower())}
-    if not text_tokens:
-        return 0.0
-    overlap = len(query_tokens & text_tokens)
-    return overlap / max(1, min(8, len(query_tokens)))
-
-
 class HybridTextRetriever:
     """Text retriever with BM25 + OpenCLIP dense search, fused via RRF."""
 
@@ -585,6 +577,7 @@ class TextReranker:
     def rerank(self, query: str, hits: list[dict], top_k: int) -> list[dict]:
         if not hits:
             return []
+        # If text reranking is disabled, return the top k hits with their retrieval scores
         if not self.settings.text_reranker_enabled:
             out = [dict(hit) for hit in hits[:top_k]]
             for rank, row in enumerate(out, start=1):
@@ -593,6 +586,7 @@ class TextReranker:
                 row["score"] = row["text_rerank_score"]
             return out
 
+        # If text reranking is enabled but CrossEncoder is not available, raise an error
         if not self.available or self._cross_encoder is None:
             raise RuntimeError(
                 "Text reranker is enabled but CrossEncoder could not be loaded. "
@@ -600,35 +594,110 @@ class TextReranker:
             )
 
         out: list[dict] = []
-        pairs = [(query, str(hit.get("text", ""))) for hit in hits]
-        scores = self._cross_encoder.predict(pairs)
+        pairs = [(query, str(hit.get("text", ""))) for hit in hits] # Build (query, document text) pairs for each hit
+        scores = self._cross_encoder.predict(pairs) # Get relevance scores for each pair
         for hit, score in zip(hits, scores, strict=False):
             row = dict(hit)
-            row["text_rerank_score"] = float(score)
+            row["text_rerank_score"] = float(score) # Write relevance score
             out.append(row)
-        out.sort(key=lambda x: float(x.get("text_rerank_score", 0.0)), reverse=True)
+        out.sort(key=lambda x: float(x.get("text_rerank_score", 0.0)), reverse=True) # Sort all hits descending by relevance score
         for rank, row in enumerate(out, start=1):
-            row["text_rerank_rank"] = rank
-            row["score"] = float(row.get("text_rerank_score", 0.0))
+            row["text_rerank_rank"] = rank # Assign final rank to each hit
+            row["score"] = float(row.get("text_rerank_score", 0.0)) # Set final score to relevance score
         return out[:top_k]
 
 
 class VisualReranker:
-    """Cheap visual reranker over image candidates for Pipeline 3 ablation."""
+    """Visual reranker based on BLIP image-text matching (ITM)."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.model_name = settings.visual_reranker_model
+        self.device = self._select_device()
+        self._processor = None
+        self._model = None
+        self.available = False
+        self._init_model()
+
+    @staticmethod
+    def _select_device() -> str:
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    def _init_model(self) -> None:
+        if not self.settings.visual_rerank_enabled:
+            return
+        try:
+            from transformers import BlipForImageTextRetrieval, BlipProcessor
+
+            self._processor = BlipProcessor.from_pretrained(self.model_name)
+            self._model = BlipForImageTextRetrieval.from_pretrained(self.model_name)
+            self._model = self._model.to(self.device).eval()
+            self.available = True
+        except Exception as e:
+            print(f"[VisualReranker] BLIP ITM unavailable ({e}).")
+            self._processor = None
+            self._model = None
+            self.available = False
+
+    def _load_candidate_image(self, hit: dict) -> Image.Image | None:
+        """Load a candidate image from absolute path or KB-relative path."""
+        raw_path = str(hit.get("path", "")).strip()
+        if raw_path:
+            image_path = Path(raw_path)
+        else:
+            rel = str(hit.get("relative_path", "")).strip()
+            image_path = _BASE_DIR / rel if rel else None
+        if not image_path or not image_path.exists():
+            return None
+        try:
+            with Image.open(image_path) as opened:
+                return opened.convert("RGB")
+        except Exception:
+            return None
+
+    def _score_pair(self, query: str, image: Image.Image) -> float:
+        """Return BLIP ITM relevance score in [0, 1]."""
+        if self._processor is None or self._model is None:
+            raise RuntimeError("Visual reranker model is not initialized.")
+        inputs = self._processor(images=image, text=query, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = self._model(**inputs, use_itm_head=True)
+        logits = getattr(outputs, "itm_score", None)
+        if logits is None:
+            logits = outputs[0]
+        probs = torch.softmax(logits, dim=-1)
+        return float(probs[0, 1].item())
 
     def rerank(self, query: str, hits: list[dict], top_k: int) -> list[dict]:
+        """Rerank image candidates with BLIP ITM; keep score fields for logging."""
+        if not hits:
+            return []
+        if not self.settings.visual_rerank_enabled:
+            out = [dict(hit) for hit in hits[:top_k]]
+            for rank, row in enumerate(out, start=1):
+                row["visual_rerank_rank"] = rank
+                row["visual_rerank_score"] = _normalize_image_similarity(float(row.get("distance", 1.0)))
+            return out
+
+        if not self.available:
+            raise RuntimeError(
+                "Visual reranker is enabled but BLIP ITM could not be loaded. "
+                "Install dependencies and verify VISUAL_RERANKER_MODEL."
+            )
+
         out: list[dict] = []
         for hit in hits:
             row = dict(hit)
-            distance = float(row.get("distance", 1.0))
-            clip_similarity = _normalize_image_similarity(distance)
-            meta_text = " ".join(
-                str(row.get(k, ""))
-                for k in ("filename", "relative_path", "course", "source_path", "doc_id")
-            )
-            lexical_hint = _keyword_overlap_score(query, meta_text)
-            # Mostly visual signal; tiny lexical hint for stable tie-breaking.
-            row["visual_rerank_score"] = 0.9 * clip_similarity + 0.1 * lexical_hint
+            image = self._load_candidate_image(row)
+            if image is None:
+                row["visual_rerank_score"] = 0.0
+            else:
+                row["visual_rerank_score"] = self._score_pair(query, image)
             out.append(row)
 
         out.sort(key=lambda x: float(x.get("visual_rerank_score", 0.0)), reverse=True)
@@ -681,7 +750,7 @@ def get_text_reranker() -> TextReranker:
 def get_visual_reranker() -> VisualReranker:
     global _VISUAL_RERANKER
     if _VISUAL_RERANKER is None:
-        _VISUAL_RERANKER = VisualReranker()
+        _VISUAL_RERANKER = VisualReranker(get_settings())
     return _VISUAL_RERANKER
 
 
@@ -855,6 +924,7 @@ class ImageIndex:
                     "distance": float(dist),
                     "source_kind": source_kind,
                     "filename": filename,
+                    "path": str(meta.get("path", "")),
                     "relative_path": str(meta.get("relative_path", "")),
                     "doc_id": str(meta.get("doc_id", "")),
                     "unit_id": str(meta.get("unit_id", "")),

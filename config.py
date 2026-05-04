@@ -55,6 +55,7 @@ class Settings:
     text_reranker_model: str
     text_rerank_top_n: int
     visual_rerank_enabled: bool
+    visual_reranker_model: str
     visual_rerank_top_n: int
     multimodal_fusion_alpha: float
     multimodal_fusion_k: int
@@ -125,6 +126,9 @@ def load_settings() -> Settings:
         ).strip(),
         text_rerank_top_n=_int_env("TEXT_RERANK_TOP_N", 16),
         visual_rerank_enabled=_bool_env("VISUAL_RERANK_ENABLED", False),
+        visual_reranker_model=(
+            os.environ.get("VISUAL_RERANKER_MODEL") or "Salesforce/blip-itm-base-coco"
+        ).strip(),
         visual_rerank_top_n=_int_env("VISUAL_RERANK_TOP_N", 8),
         multimodal_fusion_alpha=_float_env("MULTIMODAL_FUSION_ALPHA", 0.7, 0.0, 1.0),
         multimodal_fusion_k=_int_env("MULTIMODAL_FUSION_K", 8),
