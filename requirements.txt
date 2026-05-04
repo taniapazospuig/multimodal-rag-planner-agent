@@ -14,5 +14,6 @@ pytesseract>=0.3.13
 Pillow>=10.0
 torch>=2.2
 open-clip-torch>=2.24.0
+sentence-transformers>=3.0
 
 python-dotenv>=1.0

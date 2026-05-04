@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-# Requested defaults:
+# Defaults if environment variables missing:
 # - LLM: gemini-3.1-flash-lite-preview
 # - Embeddings: OpenCLIP ViT-B-32 + laion2b_s34b_b79k
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
@@ -16,11 +16,13 @@ DEFAULT_OPENCLIP_PRETRAINED = "laion2b_s34b_b79k"
 
 
 class LLMBackend(str, Enum):
+    """Supported LLM backends."""
     GEMINI = "gemini"
     OLLAMA = "ollama"
 
 
 class RAGPipelineMode(str, Enum):
+    """Supported RAG pipeline modes."""
     TEXT_ONLY = "text_only"
     TEXT_RETRIEVAL_MLLM = "text_retrieval_mllm"
     MULTIMODAL_RETRIEVAL_MLLM = "multimodal_retrieval_mllm"
@@ -28,12 +30,13 @@ class RAGPipelineMode(str, Enum):
 
 @dataclass(frozen=True)
 class Settings:
+    """Runtime settings for the planner agent."""
     # LLM
     llm_backend: LLMBackend
     gemini_model: str
     gemini_api_key: str | None
 
-    # Kept for compatibility with planner_agent's optional Ollama branch.
+    # Kept for compatibility with planner_agent's optional Ollama branch
     ollama_base_url: str
     ollama_model: str
 
@@ -48,13 +51,36 @@ class Settings:
     bm25_k: int
     hybrid_k: int
     rrf_k: int
+    text_reranker_enabled: bool
+    text_reranker_model: str
+    text_rerank_top_n: int
+    visual_rerank_enabled: bool
+    visual_rerank_top_n: int
+    multimodal_fusion_alpha: float
+    multimodal_fusion_k: int
 
 
 def _int_env(name: str, default: int) -> int:
+    """Convert environment variable to int, with minimum 1."""
     try:
         return max(1, int((os.environ.get(name) or str(default)).strip()))
     except ValueError:
         return default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _float_env(name: str, default: float, low: float, high: float) -> float:
+    try:
+        value = float((os.environ.get(name) or str(default)).strip())
+    except ValueError:
+        return default
+    return max(low, min(high, value))
 
 
 def load_settings() -> Settings:
@@ -93,4 +119,13 @@ def load_settings() -> Settings:
         bm25_k=_int_env("TEXT_BM25_K", 12),
         hybrid_k=_int_env("TEXT_HYBRID_K", 6),
         rrf_k=_int_env("TEXT_RRF_K", 60),
+        text_reranker_enabled=_bool_env("TEXT_RERANKER_ENABLED", True),
+        text_reranker_model=(
+            os.environ.get("TEXT_RERANKER_MODEL") or "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        ).strip(),
+        text_rerank_top_n=_int_env("TEXT_RERANK_TOP_N", 16),
+        visual_rerank_enabled=_bool_env("VISUAL_RERANK_ENABLED", False),
+        visual_rerank_top_n=_int_env("VISUAL_RERANK_TOP_N", 8),
+        multimodal_fusion_alpha=_float_env("MULTIMODAL_FUSION_ALPHA", 0.7, 0.0, 1.0),
+        multimodal_fusion_k=_int_env("MULTIMODAL_FUSION_K", 8),
     )

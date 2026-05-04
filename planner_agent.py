@@ -17,7 +17,7 @@ import re
 import warnings
 from collections import defaultdict
 from pathlib import Path
-from typing import List, TypedDict
+from typing import Any, List, TypedDict
 
 from urllib3.exceptions import NotOpenSSLWarning
 from PIL import Image
@@ -138,22 +138,31 @@ def _format_text_context_mode_banner(settings: Settings, indexed_mode: str | Non
 
 @tool
 def retrieve_context(query: str) -> str:
+    """Retrieve and rerank context for all ablation modes."""
     settings = get_settings()
     mode = settings.rag_mode
     text_retriever = get_text_retriever()
-    text_hits = text_retriever.search(query)
-    if not text_hits:
+    text_candidates = text_retriever.search(query, k=max(settings.hybrid_k, settings.text_rerank_top_n))
+    if not text_candidates:
         return (
             "No text index found yet. Run:\n"
             "python scripts/index_text_chunks.py\n"
             "Then retry your question."
         )
 
+    text_reranker = get_text_reranker()
+    text_hits = text_reranker.rerank(query, text_candidates, top_k=settings.hybrid_k)
+    text_reranker_mode = "disabled" if not settings.text_reranker_enabled else "cross-encoder"
+
     lines = [
         f"[retrieval mode={mode.value}]",
         _format_text_context_mode_banner(settings, text_retriever.indexed_text_context_mode),
+        (
+            f"[text reranker={text_reranker_mode} "
+            f"enabled={settings.text_reranker_enabled} model={settings.text_reranker_model}]"
+        ),
     ]
-    lines.append("Top text context (BM25 + OpenCLIP fused with RRF):")
+    lines.append("Top text context (hybrid retrieval -> text reranker):")
     for i, hit in enumerate(text_hits, start=1):
         meta = hit.get("metadata", {})
         score = float(hit.get("score", 0.0))
@@ -167,11 +176,48 @@ def retrieve_context(query: str) -> str:
         )
 
     if mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM:
-        image_hits = get_image_index().search(query, k=3)
+        image_candidates = get_image_index().search(query, k=max(3, settings.visual_rerank_top_n))
+        image_hits = image_candidates[:3]
+        if settings.visual_rerank_enabled and image_candidates:
+            image_hits = get_visual_reranker().rerank(query, image_candidates, top_k=3)
+
         if image_hits:
-            lines.append("Top image context (OpenCLIP image index):")
+            lines.append(
+                f"[visual reranker enabled={settings.visual_rerank_enabled} method=clip-similarity]"
+            )
+            fused = _fuse_multimodal_hits(
+                text_hits=text_hits,
+                image_hits=image_hits,
+                text_alpha=settings.multimodal_fusion_alpha,
+                rrf_k=settings.rrf_k,
+                top_k=settings.multimodal_fusion_k,
+            )
+            lines.append("Fused multimodal context (weighted RRF over reranked text/image candidates):")
+            for i, row in enumerate(fused, start=1):
+                kind = str(row.get("kind", "unknown"))
+                fused_score = float(row.get("score", 0.0))
+                item = row.get("item") or {}
+                if kind == "text":
+                    meta = item.get("metadata", {})
+                    text = str(item.get("text", "")).replace("\n", " ").strip()
+                    if len(text) > 160:
+                        text = text[:160].rstrip() + "..."
+                    lines.append(
+                        f"{i}. [text] fused={fused_score:.4f} | "
+                        f"course={meta.get('course','?')} | doc_id={meta.get('doc_id','?')} | {text}"
+                    )
+                else:
+                    filename = str(item.get("filename", "?"))
+                    rel_path = str(item.get("relative_path", "")).strip()
+                    lines.append(
+                        f"{i}. [image] fused={fused_score:.4f} | "
+                        f"path={rel_path or filename} | doc_id={item.get('doc_id','?')}"
+                    )
+
+            lines.append("Top image context (image retrieval -> visual reranker):")
             for i, hit in enumerate(image_hits, start=1):
                 dist = float(hit.get("distance", 0.0))
+                score = float(hit.get("visual_rerank_score", _normalize_image_similarity(dist)))
                 source_kind = str(hit.get("source_kind", "unknown"))
                 course = str(hit.get("course", "")).strip()
                 doc_id = str(hit.get("doc_id", "")).strip()
@@ -186,7 +232,10 @@ def retrieve_context(query: str) -> str:
                     details.append(f"doc_id={doc_id}")
                 if page_number > 0:
                     details.append(f"page={page_number}")
-                lines.append(f"{i}. {filename} (distance {dist:.3f}) | " + " | ".join(details))
+                lines.append(
+                    f"{i}. score={score:.4f} | {filename} (distance {dist:.3f}) | "
+                    + " | ".join(details)
+                )
 
     return "\n".join(lines)
 
@@ -350,6 +399,26 @@ def _rrf_fuse(
     return dict(scores)
 
 
+def _rank_to_rrf_score(rank: int, k: int) -> float:
+    return 1.0 / (k + rank)
+
+
+def _normalize_image_similarity(distance: float) -> float:
+    # Chroma returns cosine distance (lower is better); convert to [0, 1] similarity.
+    return max(0.0, min(1.0, 1.0 - distance))
+
+
+def _keyword_overlap_score(query: str, text: str) -> float:
+    query_tokens = {t for t in re.findall(r"[a-z0-9]{3,}", query.lower())}
+    if not query_tokens:
+        return 0.0
+    text_tokens = {t for t in re.findall(r"[a-z0-9]{3,}", text.lower())}
+    if not text_tokens:
+        return 0.0
+    overlap = len(query_tokens & text_tokens)
+    return overlap / max(1, min(8, len(query_tokens)))
+
+
 class HybridTextRetriever:
     """Text retriever with BM25 + OpenCLIP dense search, fused via RRF."""
 
@@ -429,14 +498,15 @@ class HybridTextRetriever:
             out.append(str(row.get("chunk_id")))
         return out
 
-    def search(self, query: str) -> list[dict]:
+    def search(self, query: str, k: int | None = None) -> list[dict]:
         course_filter = _detect_course_filter(query)
         where = {"course": course_filter} if course_filter else None
 
         dense_ids = self._dense_search(query, where=where)
         bm25_ids = self._bm25_search(query, course_filter=course_filter)
         fused = _rrf_fuse(dense_ids, bm25_ids, k=self.settings.rrf_k)
-        ranked_ids = sorted(fused.keys(), key=lambda x: fused[x], reverse=True)[: self.settings.hybrid_k]
+        out_k = k or self.settings.hybrid_k
+        ranked_ids = sorted(fused.keys(), key=lambda x: fused[x], reverse=True)[:out_k]
 
         out: list[dict] = []
         for chunk_id in ranked_ids:
@@ -446,6 +516,7 @@ class HybridTextRetriever:
                     {
                         "chunk_id": chunk_id,
                         "score": fused[chunk_id],
+                        "retrieval_score": fused[chunk_id],
                         "text": str(row.get("text", "")),
                         "metadata": row.get("metadata", {}),
                     }
@@ -462,6 +533,7 @@ class HybridTextRetriever:
                 {
                     "chunk_id": chunk_id,
                     "score": fused[chunk_id],
+                    "retrieval_score": fused[chunk_id],
                     "text": text,
                     "metadata": meta,
                 }
@@ -485,6 +557,132 @@ def get_text_retriever() -> HybridTextRetriever:
     if _TEXT_RETRIEVER is None:
         _TEXT_RETRIEVER = HybridTextRetriever(get_settings())
     return _TEXT_RETRIEVER
+
+
+class TextReranker:
+    """Second-stage text reranker using a local cross-encoder."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.model_name = settings.text_reranker_model
+        self._cross_encoder = None
+        self.available = False
+        self._init_model()
+
+    def _init_model(self) -> None:
+        if not self.settings.text_reranker_enabled:
+            return
+        try:
+            from sentence_transformers import CrossEncoder
+
+            self._cross_encoder = CrossEncoder(self.model_name)
+            self.available = True
+        except Exception as e:
+            print(f"[TextReranker] CrossEncoder unavailable ({e}).")
+            self._cross_encoder = None
+            self.available = False
+
+    def rerank(self, query: str, hits: list[dict], top_k: int) -> list[dict]:
+        if not hits:
+            return []
+        if not self.settings.text_reranker_enabled:
+            out = [dict(hit) for hit in hits[:top_k]]
+            for rank, row in enumerate(out, start=1):
+                row["text_rerank_rank"] = rank
+                row["text_rerank_score"] = float(row.get("retrieval_score", row.get("score", 0.0)))
+                row["score"] = row["text_rerank_score"]
+            return out
+
+        if not self.available or self._cross_encoder is None:
+            raise RuntimeError(
+                "Text reranker is enabled but CrossEncoder could not be loaded. "
+                "Install dependencies and verify TEXT_RERANKER_MODEL."
+            )
+
+        out: list[dict] = []
+        pairs = [(query, str(hit.get("text", ""))) for hit in hits]
+        scores = self._cross_encoder.predict(pairs)
+        for hit, score in zip(hits, scores, strict=False):
+            row = dict(hit)
+            row["text_rerank_score"] = float(score)
+            out.append(row)
+        out.sort(key=lambda x: float(x.get("text_rerank_score", 0.0)), reverse=True)
+        for rank, row in enumerate(out, start=1):
+            row["text_rerank_rank"] = rank
+            row["score"] = float(row.get("text_rerank_score", 0.0))
+        return out[:top_k]
+
+
+class VisualReranker:
+    """Cheap visual reranker over image candidates for Pipeline 3 ablation."""
+
+    def rerank(self, query: str, hits: list[dict], top_k: int) -> list[dict]:
+        out: list[dict] = []
+        for hit in hits:
+            row = dict(hit)
+            distance = float(row.get("distance", 1.0))
+            clip_similarity = _normalize_image_similarity(distance)
+            meta_text = " ".join(
+                str(row.get(k, ""))
+                for k in ("filename", "relative_path", "course", "source_path", "doc_id")
+            )
+            lexical_hint = _keyword_overlap_score(query, meta_text)
+            # Mostly visual signal; tiny lexical hint for stable tie-breaking.
+            row["visual_rerank_score"] = 0.9 * clip_similarity + 0.1 * lexical_hint
+            out.append(row)
+
+        out.sort(key=lambda x: float(x.get("visual_rerank_score", 0.0)), reverse=True)
+        for rank, row in enumerate(out, start=1):
+            row["visual_rerank_rank"] = rank
+        return out[:top_k]
+
+
+def _fuse_multimodal_hits(
+    text_hits: list[dict],
+    image_hits: list[dict],
+    text_alpha: float,
+    rrf_k: int,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    fused: list[dict[str, Any]] = []
+
+    for rank, hit in enumerate(text_hits, start=1):
+        fused.append(
+            {
+                "kind": "text",
+                "item": hit,
+                "score": text_alpha * _rank_to_rrf_score(rank, rrf_k),
+            }
+        )
+    for rank, hit in enumerate(image_hits, start=1):
+        fused.append(
+            {
+                "kind": "image",
+                "item": hit,
+                "score": (1.0 - text_alpha) * _rank_to_rrf_score(rank, rrf_k),
+            }
+        )
+
+    fused.sort(key=lambda x: float(x["score"]), reverse=True)
+    return fused[:top_k]
+
+
+_TEXT_RERANKER: TextReranker | None = None
+_VISUAL_RERANKER: VisualReranker | None = None
+
+
+def get_text_reranker() -> TextReranker:
+    global _TEXT_RERANKER
+    if _TEXT_RERANKER is None:
+        _TEXT_RERANKER = TextReranker(get_settings())
+    return _TEXT_RERANKER
+
+
+def get_visual_reranker() -> VisualReranker:
+    global _VISUAL_RERANKER
+    if _VISUAL_RERANKER is None:
+        _VISUAL_RERANKER = VisualReranker()
+    return _VISUAL_RERANKER
 
 
 # =========================

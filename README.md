@@ -25,9 +25,54 @@ Environment variables (see `.env.example`):
 
 - `planner_agent.py` — LangGraph agent, tools, CLIP/Chroma image index
 - `config.py` — settings and `RAGPipelineMode` enum for ablations
+- `scripts/index_text_chunks.py` — builds `text_chunks` Chroma index + BM25 corpus from chunked KB
+- `scripts/render_pdf_pages.py` — renders PDF pages to PNG files + manifest
+- `scripts/index_pdf_page_images.py` — indexes rendered PDF page images into `planner_images`
 - `data/kb/courses.csv` — seed rows for your three courses (replace with real data)
 - `data/kb/images/` — image KB drop zone
 - `chroma_db/` — local persistent Chroma (gitignored)
+
+## Build the text index
+
+After extraction/chunking is ready:
+
+```bash
+python scripts/index_text_chunks.py
+python scripts/render_pdf_pages.py
+python scripts/index_pdf_page_images.py
+python planner_agent.py
+```
+
+`planner_agent.py` now indexes both:
+- manual images under `data/kb/images/`
+- rendered PDF page images referenced in `data/kb/01_processed/rendered/pdf_pages_manifest.jsonl`
+
+### Context ablation indexing (for later metric comparison)
+
+Build both variants with identical retrieval settings:
+
+```bash
+# A) Plain chunks (no deterministic context prefix)
+python scripts/index_text_chunks.py \
+  --context-mode none \
+  --collection text_chunks_none \
+  --bm25-out-path data/kb/02_index/bm25_corpus_none.jsonl
+
+# B) Deterministic metadata-contextualized chunks
+python scripts/index_text_chunks.py \
+  --context-mode metadata \
+  --collection text_chunks_metadata \
+  --bm25-out-path data/kb/02_index/bm25_corpus_metadata.jsonl
+```
+
+Then switch `.env` between runs when evaluating:
+- `TEXT_COLLECTION_NAME=text_chunks_none` + `TEXT_BM25_PATH=data/kb/02_index/bm25_corpus_none.jsonl` + `TEXT_CONTEXT_MODE=none`
+- `TEXT_COLLECTION_NAME=text_chunks_metadata` + `TEXT_BM25_PATH=data/kb/02_index/bm25_corpus_metadata.jsonl` + `TEXT_CONTEXT_MODE=metadata`
+
+`retrieve_context` now uses a hybrid retriever:
+- dense: OpenCLIP text embeddings in Chroma (`text_chunks`)
+- sparse: BM25 over a saved corpus file (`data/kb/02_index/bm25_corpus.jsonl`)
+- fusion: Reciprocal Rank Fusion (RRF)
 
 ## Choosing Ollama (LLaVA-Phi3) vs Gemini Flash‑Lite
 
