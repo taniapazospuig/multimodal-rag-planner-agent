@@ -20,6 +20,8 @@ from collections import Counter
 from pathlib import Path
 from statistics import mean
 
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXTRACTED_PATH = PROJECT_ROOT / "data/kb/01_processed/extracted/documents_extracted.jsonl"
@@ -27,7 +29,10 @@ PAGES_MANIFEST_PATH = PROJECT_ROOT / "data/kb/01_processed/rendered/pdf_pages_ma
 OUT_PATH = PROJECT_ROOT / "data/kb/01_processed/chunked/chunks_recursive.jsonl"
 SCHEMA_PATH = PROJECT_ROOT / "data/kb/01_processed/chunked/chunk_schema.json"
 
+# Try paragraph boundaries first, then line, sentence, words, and finally character level fallback
 SEPARATORS = ["\n\n", "\n", ". ", "; ", ": ", " ", ""]
+
+# Used to avoid dropping short chunks that contain technical signal
 TECHNICAL_KEYWORDS = {
     "attention",
     "embedding",
@@ -46,18 +51,19 @@ TECHNICAL_KEYWORDS = {
 
 
 def normalize_text(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n") # Unify line endings
+    text = re.sub(r"[ \t]+", " ", text) # Collapse multiple spaces
+    text = re.sub(r"\n{3,}", "\n\n", text) # Collapse multiple newlines
     return text.strip()
 
 
 def estimate_tokens(text: str) -> int:
-    # Deterministic token estimate without external tokenizer dependency.
+    """Rough token count for chunk sizing; no external tokenizer."""
     return len(re.findall(r"[A-Za-z0-9_]+|[^\s]", text))
 
 
 def merge_small_chunks(chunks: list[str], min_keep_tokens: int) -> list[str]:
+    """Join consecutive chunks until each meets min_keep_tokens (or only one remains)."""
     if not chunks:
         return []
 
@@ -66,19 +72,23 @@ def merge_small_chunks(chunks: list[str], min_keep_tokens: int) -> list[str]:
     while i < len(chunks):
         cur = chunks[i]
         cur_tokens = estimate_tokens(cur)
+        # Big enough, or nothing to merge with (single-chunk input).
         if cur_tokens >= min_keep_tokens or len(chunks) == 1:
             merged.append(cur)
             i += 1
             continue
 
         if i + 1 < len(chunks):
+            # Prefer gluing forward so order stays left-to-right.
             next_chunk = chunks[i + 1]
             merged.append(normalize_text(f"{cur} {next_chunk}"))
             i += 2
         elif merged:
+            # Last piece is still tiny: append to previous merged chunk.
             merged[-1] = normalize_text(f"{merged[-1]} {cur}")
             i += 1
         else:
+            # Only chunk and below threshold (edge case): keep as-is.
             merged.append(cur)
             i += 1
 
@@ -91,6 +101,7 @@ def _contains_technical_signal(text: str) -> bool:
 
 
 def _is_low_value_slide_title_chunk(row: dict, text: str, tokens: int) -> bool:
+    """True if this short annotated-slides chunk looks like a title slide, not content."""
     if str(row.get("resource_type", "")) != "annotated_lecture_slides":
         return False
     if tokens >= 30:
@@ -115,7 +126,7 @@ def _is_low_value_slide_title_chunk(row: dict, text: str, tokens: int) -> bool:
 
 
 def postprocess_chunk_texts(row: dict, chunk_texts: list[str]) -> list[str]:
-    # Drop low-value tiny title chunks for annotated lecture slides.
+    """Filter slide junk, normalize; returns non-empty strings only."""
     out: list[str] = []
     for text in chunk_texts:
         tokens = estimate_tokens(text)
@@ -140,6 +151,7 @@ def load_jsonl(path: Path) -> list[dict]:
 
 
 def build_page_image_lookup(rows: list[dict]) -> dict[tuple[str, str], str]:
+    """Build doc_id + unit_id -> page_image_path lookup."""
     lookup: dict[tuple[str, str], str] = {}
     for row in rows:
         doc_id = str(row.get("doc_id", ""))
@@ -157,14 +169,7 @@ def chunk_unit_text(
     min_keep_tokens: int,
     row: dict,
 ) -> list[str]:
-    try:
-        from langchain_text_splitters import RecursiveCharacterTextSplitter  # type: ignore
-    except Exception as exc:
-        raise RuntimeError(
-            "Missing dependency langchain-text-splitters. "
-            "Install it with: python3 -m pip install langchain-text-splitters"
-        ) from exc
-
+    """Recursive split, merge tiny pieces, then slide-specific postprocess."""
     splitter = RecursiveCharacterTextSplitter(
         separators=SEPARATORS,
         chunk_size=target_tokens,
