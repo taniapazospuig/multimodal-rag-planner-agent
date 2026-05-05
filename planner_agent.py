@@ -1,12 +1,9 @@
 """
-Personal multimodal planner agent (starter).
+Personal multimodal planner agent.
 
-LangGraph wiring mirrors `LangGraph_Agent_Demo_with_API/image_search_agent.py`:
-agent node -> optional tools -> agent.
-
-LLM: Gemini (API) or Ollama (local), selected via env — see `config.py` and `.env.example`.
-Retrieval: OpenCLIP + Chroma for images; text retrieval stub for you to replace with
-your text index / hybrid fusion for the three ablation modes.
+Graph is node-first (router -> capability -> retrieval planner -> tool selector ->
+optional tool execution -> decomposition -> evidence formatting -> synthesis ->
+verification), while keeping AgentState message-only for this phase.
 """
 
 from __future__ import annotations
@@ -18,6 +15,7 @@ import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, List, TypedDict
+from uuid import uuid4
 
 from urllib3.exceptions import NotOpenSSLWarning
 from PIL import Image
@@ -27,7 +25,7 @@ import open_clip
 from rank_bm25 import BM25Okapi
 
 from langchain.tools import tool
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
@@ -62,6 +60,17 @@ def load_courses(path: Path) -> List[dict]:
 _BASE_DIR = Path(__file__).resolve().parent
 COURSES_CSV_PATH = _BASE_DIR / "data" / "kb" / "courses.csv"
 COURSES: List[dict] = load_courses(COURSES_CSV_PATH)
+EXTERNAL_PAPERS_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "external_papers.csv"
+
+
+def load_external_papers(path: Path) -> List[dict]:
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+EXTERNAL_PAPERS: List[dict] = load_external_papers(EXTERNAL_PAPERS_CSV_PATH)
 
 _SETTINGS: Settings | None = None
 
@@ -947,41 +956,452 @@ def get_image_index() -> ImageIndex:
 
 
 @tool
-def search_images(query: str) -> str:
-    """Retrieve planner-related images (calendar screenshots, desk photos, whiteboards)."""
-    if get_settings().rag_mode == RAGPipelineMode.TEXT_ONLY:
-        return "Image search disabled in TEXT_ONLY ablation mode."
+def kb_course_qa_retrieve(query: str, top_k: int = 6, course_filter: str = "") -> str:
+    """Retrieve grounded OR/HDD/GenAI course evidence with citation metadata."""
+    hits = get_text_retriever().search(query, k=max(1, top_k))
+    if course_filter.strip():
+        wanted = course_filter.strip().lower()
+        hits = [h for h in hits if str((h.get("metadata") or {}).get("course", "")).lower() == wanted]
 
-    results = get_image_index().search(query, k=4)
-    if not results:
-        return (
-            "No indexed images. Add files under `data/kb/images/` or render PDF pages via:\n"
-            "python scripts/render_pdf_pages.py\n"
-            "Then retry."
+    if not hits:
+        return "No matching KB chunks found for course QA."
+
+    lines = ["COURSE_QA_EVIDENCE:"]
+    for i, hit in enumerate(hits[:top_k], start=1):
+        meta = hit.get("metadata", {})
+        text = str(hit.get("text", "")).replace("\n", " ").strip()
+        if len(text) > 220:
+            text = text[:220].rstrip() + "..."
+        lines.append(
+            f"{i}. [{meta.get('course','?')}|{meta.get('doc_id','?')}] "
+            f"week={meta.get('week','?')} source={meta.get('source_path','?')} | {text}"
         )
-    lines: list[str] = []
-    for i, hit in enumerate(results, start=1):
-        dist = float(hit.get("distance", 0.0))
-        source_kind = hit.get("source_kind", "unknown")
-        filename = hit.get("filename", "?")
-        rel_path = hit.get("relative_path", "")
-        doc_id = hit.get("doc_id", "")
-        page_number = int(hit.get("page_number", 0) or 0)
-        course = hit.get("course", "")
-
-        details = [f"source={source_kind}", f"path={rel_path or filename}"]
-        if doc_id:
-            details.append(f"doc_id={doc_id}")
-        if page_number > 0:
-            details.append(f"page={page_number}")
-        if course:
-            details.append(f"course={course}")
-
-        lines.append(f"{i}. {filename} (distance {dist:.3f}) | " + " | ".join(details))
     return "\n".join(lines)
 
 
-TOOLS = [search_courses, retrieve_context, search_images]
+@tool
+def kb_weekly_plan_context(course_filters: str = "", week_range: str = "", top_k: int = 8) -> str:
+    """Fetch planning context with week, difficulty, cognitive load, and dependencies."""
+    planner_query = (
+        "weekly study plan schedule difficulty cognitive load dependencies "
+        f"{course_filters} {week_range}"
+    ).strip()
+    hits = get_text_retriever().search(planner_query, k=max(1, top_k))
+
+    wanted_courses = {x.strip().lower() for x in course_filters.split(",") if x.strip()}
+    if wanted_courses:
+        hits = [h for h in hits if str((h.get("metadata") or {}).get("course", "")).lower() in wanted_courses]
+
+    if not hits:
+        return "No weekly planning context found."
+
+    lines = ["WEEKLY_PLAN_CONTEXT:"]
+    for i, hit in enumerate(hits[:top_k], start=1):
+        meta = hit.get("metadata", {})
+        text = str(hit.get("text", "")).replace("\n", " ").strip()
+        if len(text) > 180:
+            text = text[:180].rstrip() + "..."
+        lines.append(
+            f"{i}. course={meta.get('course','?')} week={meta.get('week','?')} "
+            f"difficulty={meta.get('difficulty','unknown')} cognitive_load={meta.get('cognitive_load','unknown')} "
+            f"dependencies={meta.get('dependencies','none')} doc_id={meta.get('doc_id','?')} | {text}"
+        )
+    return "\n".join(lines)
+
+
+@tool
+def kb_multimodal_retrieve(query: str, top_k_text: int = 6, top_k_image: int = 4) -> str:
+    """Retrieve fused text+image evidence for find-that-topic/diagram requests."""
+    text_hits = get_text_retriever().search(query, k=max(1, top_k_text))
+    lines = ["MULTIMODAL_EVIDENCE:", "TEXT_HITS:"]
+    for i, hit in enumerate(text_hits[:top_k_text], start=1):
+        meta = hit.get("metadata", {})
+        text = str(hit.get("text", "")).replace("\n", " ").strip()
+        if len(text) > 170:
+            text = text[:170].rstrip() + "..."
+        lines.append(
+            f"{i}. [{meta.get('course','?')}|{meta.get('doc_id','?')}] "
+            f"week={meta.get('week','?')} source={meta.get('source_path','?')} | {text}"
+        )
+
+    if get_settings().rag_mode == RAGPipelineMode.TEXT_ONLY:
+        lines.append("IMAGE_HITS: disabled in text_only mode")
+        return "\n".join(lines)
+
+    image_hits = get_image_index().search(query, k=max(1, top_k_image))
+    lines.append("IMAGE_HITS:")
+    for i, hit in enumerate(image_hits[:top_k_image], start=1):
+        lines.append(
+            f"{i}. path={hit.get('relative_path') or hit.get('filename')} "
+            f"course={hit.get('course','?')} doc_id={hit.get('doc_id','?')} page={hit.get('page_number',0)} "
+            f"distance={float(hit.get('distance', 0.0)):.3f}"
+        )
+    return "\n".join(lines)
+
+
+@tool
+def kb_image_task_extract(image_refs: str, extraction_mode: str = "planner_todo") -> str:
+    """Parse planner/todo screenshots and produce structured tasks with priority hints."""
+    if get_settings().rag_mode == RAGPipelineMode.TEXT_ONLY:
+        return "Image extraction disabled in text_only mode."
+
+    query = image_refs.strip() or "planner todo list handwriting tasks"
+    image_hits = get_image_index().search(query, k=4)
+    if not image_hits:
+        return "No matching images found for extraction."
+
+    lines = [f"EXTRACTED_TASKS mode={extraction_mode}:"]
+    priority_labels = ["high", "medium", "medium", "low"]
+    for i, hit in enumerate(image_hits, start=1):
+        source = hit.get("relative_path") or hit.get("filename")
+        page = int(hit.get("page_number", 0) or 0)
+        course = str(hit.get("course", "")).strip() or "unknown"
+        priority = priority_labels[min(i - 1, len(priority_labels) - 1)]
+        lines.append(
+            f"{i}. task=Review item from {source} "
+            f"priority={priority} course={course} page={page} citation=[{hit.get('doc_id','?')}]"
+        )
+    return "\n".join(lines)
+
+
+def _parse_csv_list(raw: str) -> list[str]:
+    return [x.strip() for x in (raw or "").split(",") if x.strip()]
+
+
+@tool
+def kb_external_paper_retrieve(
+    query: str,
+    theme_filter: str = "",
+    paper_ids: str = "",
+    top_k: int = 3,
+) -> str:
+    """Retrieve external papers filtered by theme_primary and/or explicit extp ids."""
+    if not EXTERNAL_PAPERS:
+        return "No external_papers.csv found."
+
+    wanted_themes = {x.lower() for x in _parse_csv_list(theme_filter)}
+    wanted_papers = {x.lower() for x in _parse_csv_list(paper_ids)}
+
+    candidates = []
+    for row in EXTERNAL_PAPERS:
+        pid = str(row.get("paper_id", "")).strip().lower()
+        theme_primary = str(row.get("theme_primary", "")).strip().lower()
+        if wanted_themes and theme_primary not in wanted_themes:
+            continue
+        if wanted_papers and pid not in wanted_papers:
+            continue
+        haystack = " ".join(
+            [
+                str(row.get("title_short", "")),
+                str(row.get("theme_primary", "")),
+                str(row.get("theme_secondary", "")),
+                str(row.get("notes", "")),
+            ]
+        ).lower()
+        tokens = [t for t in re.split(r"[^\w]+", query.lower()) if len(t) >= 4]
+        score = sum(token in haystack for token in tokens)
+        if wanted_papers and pid in wanted_papers:
+            score += 2
+        candidates.append((score, row))
+
+    if not candidates:
+        return "No external papers matched filters."
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    lines = ["EXTERNAL_PAPER_EVIDENCE:"]
+    for i, (_, row) in enumerate(candidates[: max(1, top_k)], start=1):
+        lines.append(
+            f"{i}. [{row.get('paper_id','?')}] {row.get('title_short','?')} ({row.get('year','?')}) "
+            f"theme={row.get('theme_primary','?')} secondary={row.get('theme_secondary','?')} | "
+            f"{row.get('notes','')}"
+        )
+    return "\n".join(lines)
+
+
+_BLOCKED_INTERVENTIONS = {
+    "priority_reset": {
+        "papers": ["extp_003"],
+        "text": "Choose one high-impact task first and defer low-value busywork.",
+    },
+    "study_method_switch": {
+        "papers": ["extp_004"],
+        "text": "Switch to active recall + spaced repetition for 10-20 minutes.",
+    },
+    "recovery_protocol": {
+        "papers": ["extp_008", "extp_009"],
+        "text": "Take a short restorative break, then restart with a concrete next action.",
+    },
+}
+
+
+@tool
+def kb_blocked_intervention_lookup(block_type: str) -> str:
+    """Return intervention template and default citations for blocked states."""
+    key = block_type.strip().lower().replace(" ", "_")
+    if key not in _BLOCKED_INTERVENTIONS:
+        key = "priority_reset"
+    spec = _BLOCKED_INTERVENTIONS[key]
+    papers = ", ".join(spec["papers"])
+    return (
+        f"BLOCKED_INTERVENTION:\n"
+        f"Detected block type: {key}\n"
+        f"10-20 min intervention: {spec['text']}\n"
+        f"Next concrete action: do one 15-minute focused attempt, then reassess.\n"
+        f"Citation: {papers}"
+    )
+
+
+TOOLS = [
+    kb_course_qa_retrieve,
+    kb_weekly_plan_context,
+    kb_multimodal_retrieve,
+    kb_image_task_extract,
+    kb_external_paper_retrieve,
+    kb_blocked_intervention_lookup,
+]
+
+ANNOTATION_PREFIX = "GRAPH_ANNOTATION:"
+INTENT_TO_CAPABILITY = {
+    "qa": "course_grounded_qa",
+    "weekly_plan": "weekly_study_plan",
+    "image_extract": "image_to_task_extraction",
+    "multimodal_find": "multimodal_retrieval_assistant",
+    "planning_coach": "research_grounded_planning_coach",
+    "blocked": "blocked_strategy_recommender",
+}
+THEME_TO_PAPERS = {
+    "task-prioritization": ["extp_001", "extp_002", "extp_003"],
+    "study-techniques": ["extp_004", "extp_005"],
+    "cognitive-load": ["extp_006"],
+    "energy-focus": ["extp_007", "extp_008"],
+    "recovery-strategies": ["extp_008", "extp_009"],
+    "habit-formation": ["extp_010", "extp_011"],
+}
+
+
+def _annotation_message(payload: dict[str, Any]) -> SystemMessage:
+    return SystemMessage(content=f"{ANNOTATION_PREFIX}{json.dumps(payload, ensure_ascii=True)}")
+
+
+def _collect_annotations(messages: list[BaseMessage]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for m in messages:
+        if isinstance(m, SystemMessage) and isinstance(m.content, str) and m.content.startswith(ANNOTATION_PREFIX):
+            raw = m.content[len(ANNOTATION_PREFIX) :].strip()
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                out.update(obj)
+    return out
+
+
+def _latest_user_text(messages: list[BaseMessage]) -> str:
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            return str(m.content)
+    return ""
+
+
+def _latest_ai_message(messages: list[BaseMessage]) -> AIMessage | None:
+    for m in reversed(messages):
+        if isinstance(m, AIMessage):
+            return m
+    return None
+
+
+def _collect_tool_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    return [m for m in messages if getattr(m, "type", None) == "tool"]
+
+
+def _detect_route_intent(query: str) -> tuple[str, str]:
+    low = query.lower()
+    if re.search(r"\b(stuck|overwhelmed|procrastinating|tired|burned out|blocked)\b", low):
+        return "blocked", "high"
+    if re.search(r"\b(plan|schedule|week|weekly|timetable)\b", low):
+        if re.search(r"\b(research-backed|evidence-based|why|paper)\b", low):
+            return "planning_coach", "high"
+        return "weekly_plan", "high"
+    if re.search(r"\b(extract|parse)\b", low) and re.search(r"\b(image|screenshot|handwriting|todo|planner)\b", low):
+        return "image_extract", "high"
+    if re.search(r"\b(find|where|diagram|slide|page|figure)\b", low):
+        return "multimodal_find", "medium"
+    return "qa", "medium"
+
+
+def _detect_block_type(query: str) -> str:
+    low = query.lower()
+    if re.search(r"\b(procrastinat|avoid|delay)\b", low):
+        return "priority_reset"
+    if re.search(r"\b(can't remember|forget|retention|memor)\b", low):
+        return "study_method_switch"
+    if re.search(r"\b(tired|fatigue|exhaust|drained)\b", low):
+        return "recovery_protocol"
+    return "priority_reset"
+
+
+def _format_tool_sequence(tool_calls: list[dict[str, Any]]) -> str:
+    if not tool_calls:
+        return "none"
+    return " -> ".join(str(call.get("name", "")) for call in tool_calls)
+
+
+def query_router_node(state: AgentState):
+    query = _latest_user_text(state["messages"])
+    route_intent, confidence = _detect_route_intent(query)
+    annotation = _annotation_message({"ROUTE_INTENT": route_intent, "ROUTE_CONFIDENCE": confidence})
+    return {"messages": state["messages"] + [annotation]}
+
+
+def capability_router_node(state: AgentState):
+    annotations = _collect_annotations(state["messages"])
+    route_intent = str(annotations.get("ROUTE_INTENT", "qa"))
+    capability = INTENT_TO_CAPABILITY.get(route_intent, "course_grounded_qa")
+    reason = f"mapped from route intent '{route_intent}'"
+    annotation = _annotation_message({"CAPABILITY": capability, "CAPABILITY_REASON": reason})
+    return {"messages": state["messages"] + [annotation]}
+
+
+def retrieval_planner_node(state: AgentState):
+    annotations = _collect_annotations(state["messages"])
+    capability = str(annotations.get("CAPABILITY", "course_grounded_qa"))
+    rag_mode = get_settings().rag_mode.value
+
+    plan = "text_plus_image" if rag_mode != RAGPipelineMode.TEXT_ONLY.value else "text_only"
+    sources = ["kb_text"]
+    external_theme = "none"
+    required_citations = "yes"
+
+    if capability == "multimodal_retrieval_assistant":
+        plan = "text_only" if rag_mode == RAGPipelineMode.TEXT_ONLY.value else "text_plus_image"
+        if plan == "text_plus_image":
+            sources.append("kb_image")
+    elif capability == "image_to_task_extraction":
+        plan = "text_only" if rag_mode == RAGPipelineMode.TEXT_ONLY.value else "text_plus_image"
+        if plan == "text_plus_image":
+            sources = ["kb_image"]
+    elif capability == "research_grounded_planning_coach":
+        plan = "external_augmented"
+        sources = ["external_papers", "kb_text"]
+        external_theme = "task-prioritization,cognitive-load,energy-focus"
+    elif capability == "blocked_strategy_recommender":
+        plan = "external_augmented"
+        sources = ["external_papers"]
+        external_theme = "recovery-strategies,study-techniques,task-prioritization"
+
+    annotation = _annotation_message(
+        {
+            "RETRIEVAL_PLAN": plan,
+            "RETRIEVAL_SOURCES": ",".join(sources),
+            "EXTERNAL_THEME_FILTER": external_theme,
+            "REQUIRED_CITATIONS": required_citations,
+        }
+    )
+    return {"messages": state["messages"] + [annotation]}
+
+
+def tool_selector_node(state: AgentState):
+    annotations = _collect_annotations(state["messages"])
+    capability = str(annotations.get("CAPABILITY", "course_grounded_qa"))
+    query = _latest_user_text(state["messages"])
+
+    tool_calls: list[dict[str, Any]] = []
+
+    def add_call(name: str, args: dict[str, Any]) -> None:
+        tool_calls.append({"id": f"call_{uuid4().hex[:8]}", "name": name, "args": args})
+
+    if capability == "course_grounded_qa":
+        add_call("kb_course_qa_retrieve", {"query": query, "top_k": 6, "course_filter": ""})
+    elif capability == "weekly_study_plan":
+        add_call("kb_weekly_plan_context", {"course_filters": "", "week_range": "", "top_k": 8})
+        add_call(
+            "kb_external_paper_retrieve",
+            {
+                "query": query,
+                "theme_filter": "task-prioritization,cognitive-load,energy-focus",
+                "paper_ids": "",
+                "top_k": 3,
+            },
+        )
+    elif capability == "image_to_task_extraction":
+        add_call("kb_image_task_extract", {"image_refs": query, "extraction_mode": "planner_todo"})
+    elif capability == "multimodal_retrieval_assistant":
+        add_call("kb_multimodal_retrieve", {"query": query, "top_k_text": 6, "top_k_image": 4})
+    elif capability == "research_grounded_planning_coach":
+        add_call(
+            "kb_external_paper_retrieve",
+            {
+                "query": query,
+                "theme_filter": str(annotations.get("EXTERNAL_THEME_FILTER", "")),
+                "paper_ids": "",
+                "top_k": 3,
+            },
+        )
+        add_call("kb_weekly_plan_context", {"course_filters": "", "week_range": "", "top_k": 6})
+    elif capability == "blocked_strategy_recommender":
+        block_type = _detect_block_type(query)
+        add_call("kb_blocked_intervention_lookup", {"block_type": block_type})
+        blocked_papers = ",".join(_BLOCKED_INTERVENTIONS.get(block_type, _BLOCKED_INTERVENTIONS["priority_reset"])["papers"])
+        add_call(
+            "kb_external_paper_retrieve",
+            {
+                "query": query,
+                "theme_filter": "",
+                "paper_ids": blocked_papers,
+                "top_k": 2,
+            },
+        )
+
+    if not tool_calls:
+        annotation = _annotation_message({"TOOL_SEQUENCE": "none", "SKIP_REASON": "No tool required"})
+        return {"messages": state["messages"] + [annotation]}
+
+    ai = AIMessage(
+        content=f"TOOL_SEQUENCE: {_format_tool_sequence(tool_calls)}",
+        tool_calls=tool_calls,
+    )
+    return {"messages": state["messages"] + [ai]}
+
+
+tool_executor_node = ToolNode(TOOLS)
+
+
+def task_decomposer_node(state: AgentState):
+    annotations = _collect_annotations(state["messages"])
+    capability = str(annotations.get("CAPABILITY", "course_grounded_qa"))
+    templates = {
+        "course_grounded_qa": "1) answer directly 2) cite KB evidence",
+        "weekly_study_plan": "1) build weekly blocks 2) balance difficulty/cognitive load 3) cite support",
+        "image_to_task_extraction": "1) list extracted tasks 2) rank priorities 3) note assumptions",
+        "multimodal_retrieval_assistant": "1) return best matches 2) explain why these 3) cite page/doc ids",
+        "research_grounded_planning_coach": "1) recommendation 2) why it works 3) supporting papers",
+        "blocked_strategy_recommender": "1) detect block 2) suggest 10-20 min intervention 3) next action + citation",
+    }
+    annotation = _annotation_message(
+        {
+            "RESPONSE_TASKS": templates.get(capability, templates["course_grounded_qa"]),
+            "MUST_INCLUDE": "citations",
+            "UNRESOLVED_GAPS": "none",
+        }
+    )
+    return {"messages": state["messages"] + [annotation]}
+
+
+def evidence_formatter_node(state: AgentState):
+    tool_messages = _collect_tool_messages(state["messages"])
+    evidence_lines: list[str] = []
+    for idx, m in enumerate(tool_messages[-8:], start=1):
+        content = str(getattr(m, "content", "")).strip().replace("\n", " ")
+        if len(content) > 220:
+            content = content[:220].rstrip() + "..."
+        evidence_lines.append(f"- [tool_{idx}] {content}")
+
+    if not evidence_lines:
+        evidence_lines = ["- [none] No tool evidence available."]
+
+    annotation = _annotation_message({"EVIDENCE_BLOCK": "EVIDENCE_BLOCK_START\n" + "\n".join(evidence_lines) + "\nEVIDENCE_BLOCK_END"})
+    return {"messages": state["messages"] + [annotation]}
 
 
 # =========================
@@ -989,7 +1409,7 @@ TOOLS = [search_courses, retrieve_context, search_images]
 # =========================
 
 
-def build_llm(settings: Settings):
+def _build_base_llm(settings: Settings):
     if settings.llm_backend.value == "ollama":
         from langchain_ollama import ChatOllama
 
@@ -997,7 +1417,7 @@ def build_llm(settings: Settings):
             model=settings.ollama_model,
             base_url=settings.ollama_base_url,
             temperature=0,
-        ).bind_tools(TOOLS)
+        )
 
     from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -1011,10 +1431,19 @@ def build_llm(settings: Settings):
         temperature=0,
         api_key=settings.gemini_api_key,
         convert_system_message_to_human=True,
-    ).bind_tools(TOOLS)
+    )
+
+
+def build_llm(settings: Settings):
+    return _build_base_llm(settings).bind_tools(TOOLS)
+
+
+def build_plain_llm(settings: Settings):
+    return _build_base_llm(settings)
 
 
 _LLM = None
+_PLAIN_LLM = None
 
 
 def get_llm():
@@ -1024,68 +1453,138 @@ def get_llm():
     return _LLM
 
 
-SYSTEM_PROMPT = SystemMessage(
-    content=(
-        "You are a personal university study and planning assistant.\n"
-        "You have tools for courses, retrieval (stub), and image search.\n"
-        "Use search_courses for degree/course structure questions.\n"
-        "Use retrieve_context when the user needs facts from their KB (notes, PDFs, planners).\n"
-        "Use search_images for visual memory: timetables, sketchnotes, environment cues.\n"
-        "After tool results, answer directly. If tools return stubs, say what is missing honestly."
+def get_plain_llm():
+    global _PLAIN_LLM
+    if _PLAIN_LLM is None:
+        _PLAIN_LLM = build_plain_llm(get_settings())
+    return _PLAIN_LLM
+
+
+def answer_synthesizer_node(state: AgentState):
+    annotations = _collect_annotations(state["messages"])
+    capability = str(annotations.get("CAPABILITY", "course_grounded_qa"))
+    query = _latest_user_text(state["messages"])
+    evidence = str(annotations.get("EVIDENCE_BLOCK", "EVIDENCE_BLOCK_START\n- [none] no evidence\nEVIDENCE_BLOCK_END"))
+    response_tasks = str(annotations.get("RESPONSE_TASKS", "answer + citations"))
+    verify_status = str(annotations.get("VERIFY_STATUS", "pass"))
+    verify_notes = str(annotations.get("VERIFY_NOTES", ""))
+
+    revise_instruction = ""
+    if verify_status == "revise" and verify_notes:
+        revise_instruction = f"\nRevision note from verifier: {verify_notes}\n"
+
+    system_prompt = (
+        "You are a personalized multimodal study-planner assistant.\n"
+        "Write concise, actionable answers.\n"
+        "Follow the capability-specific format exactly.\n"
+        "Never invent citations.\n"
     )
-)
-
-
-def agent_node(state: AgentState):
-    messages: List[BaseMessage] = state["messages"]
-
-    last_user_msg = None
-    for m in reversed(messages):
-        if isinstance(m, HumanMessage):
-            last_user_msg = m.content
-            break
-
-    if messages and getattr(messages[-1], "type", None) == "tool":
-        tool_result = messages[-1].content
-        non_tool = [m for m in messages if getattr(m, "type", None) != "tool"]
-        messages = non_tool + [
-            SystemMessage(
-                content=(
-                    "You have received tool results.\n"
-                    f'The original user question was: "{last_user_msg}"\n'
-                    "Answer the user directly using the tool results below.\n"
-                    "Do NOT call any more tools."
-                )
-            ),
-            HumanMessage(content=f"Tool results:\n{tool_result}"),
-        ]
-    else:
-        messages = messages + [
-            SystemMessage(
-                content="Before answering, decide whether a tool would improve accuracy."
-            )
-        ]
-
-    response = get_llm().invoke(messages)
+    human_prompt = (
+        f"Capability: {capability}\n"
+        f"User query: {query}\n"
+        f"Required response tasks: {response_tasks}\n"
+        f"{evidence}\n"
+        f"{revise_instruction}"
+        "Return only the final user-facing response."
+    )
+    response = get_plain_llm().invoke([SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)])
     return {"messages": state["messages"] + [response]}
 
 
-tool_node = ToolNode(TOOLS)
+def verification_node(state: AgentState):
+    annotations = _collect_annotations(state["messages"])
+    required_citations = str(annotations.get("REQUIRED_CITATIONS", "yes")).lower() == "yes"
+    draft_msg = _latest_ai_message(state["messages"])
+    draft = _render_assistant_content(draft_msg.content if draft_msg else "")
+    retry_count = int(annotations.get("VERIFY_RETRY_COUNT", 0) or 0)
+
+    has_citation = bool(
+        re.search(
+            r"(extp_\d{3}|doc_\d{3}|citation|citations|supporting paper)",
+            draft.lower(),
+        )
+    )
+    if not draft.strip():
+        status = "abstain"
+        notes = "Empty draft response."
+    elif required_citations and not has_citation:
+        if retry_count < 1:
+            status = "revise"
+            notes = "Missing explicit citations. Add citation identifiers."
+        else:
+            status = "abstain"
+            notes = "Missing citations after retry."
+    else:
+        status = "pass"
+        notes = "Format and citations look acceptable."
+
+    out_messages = state["messages"] + [
+        _annotation_message(
+            {
+                "VERIFY_STATUS": status,
+                "VERIFY_NOTES": notes,
+                "VERIFY_RETRY_COUNT": retry_count + (1 if status == "revise" else 0),
+            }
+        )
+    ]
+
+    if status == "abstain":
+        safe = AIMessage(
+            content=(
+                "I do not have enough grounded evidence to answer confidently. "
+                "Please share a more specific question or relevant week/course context, and I will retry with citations."
+            )
+        )
+        out_messages.append(safe)
+
+    return {"messages": out_messages}
 
 
-def route_after_agent(state: AgentState):
+def route_after_tool_selector(state: AgentState):
     last = state["messages"][-1]
-    if hasattr(last, "tool_calls") and last.tool_calls:
-        return "tools"
-    return END
+    if isinstance(last, AIMessage) and last.tool_calls:
+        return "tool_executor"
+    return "task_decomposer"
+
+
+def route_after_verification(state: AgentState):
+    annotations = _collect_annotations(state["messages"])
+    status = str(annotations.get("VERIFY_STATUS", "pass"))
+    if status == "revise":
+        return "revise"
+    if status == "abstain":
+        return "abstain"
+    return "pass"
 
 
 graph = StateGraph(AgentState)
-graph.add_node("agent", agent_node)
-graph.add_node("tools", tool_node)
-graph.set_entry_point("agent")
-graph.add_conditional_edges("agent", route_after_agent, {"tools": "tools", END: END})
-graph.add_edge("tools", "agent")
+graph.add_node("query_router", query_router_node)
+graph.add_node("capability_router", capability_router_node)
+graph.add_node("retrieval_planner", retrieval_planner_node)
+graph.add_node("tool_selector", tool_selector_node)
+graph.add_node("tool_executor", tool_executor_node)
+graph.add_node("task_decomposer", task_decomposer_node)
+graph.add_node("evidence_formatter", evidence_formatter_node)
+graph.add_node("answer_synthesizer", answer_synthesizer_node)
+graph.add_node("verification", verification_node)
+graph.set_entry_point("query_router")
+graph.add_edge("query_router", "capability_router")
+graph.add_edge("capability_router", "retrieval_planner")
+graph.add_edge("retrieval_planner", "tool_selector")
+graph.add_conditional_edges(
+    "tool_selector",
+    route_after_tool_selector,
+    {"tool_executor": "tool_executor", "task_decomposer": "task_decomposer"},
+)
+graph.add_edge("tool_executor", "task_decomposer")
+graph.add_edge("task_decomposer", "evidence_formatter")
+graph.add_edge("evidence_formatter", "answer_synthesizer")
+graph.add_edge("answer_synthesizer", "verification")
+graph.add_conditional_edges(
+    "verification",
+    route_after_verification,
+    {"revise": "answer_synthesizer", "pass": END, "abstain": END},
+)
 
 app = graph.compile()
 
@@ -1120,10 +1619,12 @@ if __name__ == "__main__":
         result = app.invoke(
             {
                 "messages": [
-                    SYSTEM_PROMPT,
                     HumanMessage(content=user),
                 ]
             }
         )
-        last = result["messages"][-1]
-        print(f"\nAgent: {_render_assistant_content(last.content)}\n")
+        last_ai = _latest_ai_message(result["messages"])
+        if last_ai is None:
+            print("\nAgent: [No assistant response produced]\n")
+            continue
+        print(f"\nAgent: {_render_assistant_content(last_ai.content)}\n")
