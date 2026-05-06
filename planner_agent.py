@@ -773,13 +773,24 @@ def get_image_index() -> ImageIndex:
     return _IMAGE_INDEX
 
 
-@tool
-def kb_course_qa_retrieve(query: str, top_k: int = 6, course_filter: str = "") -> str:
-    """Retrieve grounded OR/HDD/GenAI course evidence with citation metadata."""
-    hits = get_text_retriever().search(query, k=max(1, top_k))
+def _reranked_text_hits(
+    query: str,
+    final_k: int,
+    course_filter: str = "",
+) -> list[dict[str, Any]]:
+    settings = get_settings()
+    candidate_k = max(1, final_k, settings.text_rerank_top_n)
+    hits = get_text_retriever().search(query, k=candidate_k)
     if course_filter.strip():
         wanted = course_filter.strip().lower()
         hits = [h for h in hits if str((h.get("metadata") or {}).get("course", "")).lower() == wanted]
+    return get_text_reranker().rerank(query=query, hits=hits, top_k=max(1, final_k))
+
+
+@tool
+def kb_course_qa_retrieve(query: str, top_k: int = 6, course_filter: str = "") -> str:
+    """Retrieve grounded OR/HDD/GenAI course evidence with citation metadata."""
+    hits = _reranked_text_hits(query=query, final_k=max(1, top_k), course_filter=course_filter)
 
     if not hits:
         return "No matching KB chunks found for course QA."
@@ -800,15 +811,18 @@ def kb_course_qa_retrieve(query: str, top_k: int = 6, course_filter: str = "") -
 @tool
 def kb_weekly_plan_context(course_filters: str = "", week_range: str = "", top_k: int = 8) -> str:
     """Fetch planning context with week, difficulty, cognitive load, and dependencies."""
+    settings = get_settings()
     planner_query = (
         "weekly study plan schedule difficulty cognitive load dependencies "
         f"{course_filters} {week_range}"
     ).strip()
-    hits = get_text_retriever().search(planner_query, k=max(1, top_k))
+    candidate_k = max(1, top_k, settings.text_rerank_top_n)
+    stage1_hits = get_text_retriever().search(planner_query, k=candidate_k)
 
     wanted_courses = {x.strip().lower() for x in course_filters.split(",") if x.strip()}
     if wanted_courses:
-        hits = [h for h in hits if str((h.get("metadata") or {}).get("course", "")).lower() in wanted_courses]
+        stage1_hits = [h for h in stage1_hits if str((h.get("metadata") or {}).get("course", "")).lower() in wanted_courses]
+    hits = get_text_reranker().rerank(query=planner_query, hits=stage1_hits, top_k=max(1, top_k))
 
     if not hits:
         return "No weekly planning context found."
@@ -829,30 +843,82 @@ def kb_weekly_plan_context(course_filters: str = "", week_range: str = "", top_k
 
 @tool
 def kb_multimodal_retrieve(query: str, top_k_text: int = 6, top_k_image: int = 4) -> str:
-    """Retrieve fused text+image evidence for find-that-topic/diagram requests."""
-    text_hits = get_text_retriever().search(query, k=max(1, top_k_text))
-    lines = ["MULTIMODAL_EVIDENCE:", "TEXT_HITS:"]
-    for i, hit in enumerate(text_hits[:top_k_text], start=1):
+    """Retrieve reranked text/image evidence and weighted-RRF multimodal fusion."""
+    settings = get_settings()
+    text_candidate_k = max(1, top_k_text, settings.text_rerank_top_n)
+    text_stage1_hits = get_text_retriever().search(query, k=text_candidate_k)
+    text_hits = get_text_reranker().rerank(query=query, hits=text_stage1_hits, top_k=text_candidate_k)
+
+    lines = ["MULTIMODAL_EVIDENCE:"]
+
+    if settings.rag_mode == RAGPipelineMode.TEXT_ONLY:
+        lines.append("MODE: text_only (image retrieval disabled)")
+        lines.append("TEXT_HITS:")
+        for i, hit in enumerate(text_hits[: max(1, top_k_text)], start=1):
+            meta = hit.get("metadata", {})
+            text = str(hit.get("text", "")).replace("\n", " ").strip()
+            if len(text) > 170:
+                text = text[:170].rstrip() + "..."
+            lines.append(
+                f"{i}. [{meta.get('course','?')}|{meta.get('doc_id','?')}] "
+                f"week={meta.get('week','?')} source={meta.get('source_path','?')} "
+                f"text_rerank_score={float(hit.get('text_rerank_score', hit.get('score', 0.0))):.4f} | {text}"
+            )
+        return "\n".join(lines)
+
+    image_candidate_k = max(1, top_k_image, settings.visual_rerank_top_n)
+    image_stage1_hits = get_image_index().search(query, k=image_candidate_k)
+    image_hits = get_visual_reranker().rerank(query=query, hits=image_stage1_hits, top_k=image_candidate_k)
+
+    fused_hits = _fuse_multimodal_hits(
+        text_hits=text_hits,
+        image_hits=image_hits,
+        text_alpha=settings.multimodal_fusion_alpha,
+        rrf_k=settings.rrf_k,
+        top_k=max(1, settings.multimodal_fusion_k),
+    )
+
+    lines.append(
+        "FUSED_HITS: "
+        f"text_alpha={settings.multimodal_fusion_alpha:.2f} "
+        f"image_alpha={(1.0 - settings.multimodal_fusion_alpha):.2f} "
+        f"rrf_k={settings.rrf_k}"
+    )
+    for i, fused in enumerate(fused_hits, start=1):
+        kind = str(fused.get("kind", "?"))
+        item = fused.get("item", {}) or {}
+        if kind == "text":
+            meta = item.get("metadata", {})
+            lines.append(
+                f"{i}. kind=text fused_score={float(fused.get('score', 0.0)):.5f} "
+                f"course={meta.get('course','?')} doc_id={meta.get('doc_id','?')} week={meta.get('week','?')}"
+            )
+        else:
+            lines.append(
+                f"{i}. kind=image fused_score={float(fused.get('score', 0.0)):.5f} "
+                f"path={item.get('relative_path') or item.get('filename')} "
+                f"doc_id={item.get('doc_id','?')} page={item.get('page_number',0)}"
+            )
+
+    lines.append("TEXT_HITS:")
+    for i, hit in enumerate(text_hits[: max(1, top_k_text)], start=1):
         meta = hit.get("metadata", {})
         text = str(hit.get("text", "")).replace("\n", " ").strip()
         if len(text) > 170:
             text = text[:170].rstrip() + "..."
         lines.append(
             f"{i}. [{meta.get('course','?')}|{meta.get('doc_id','?')}] "
-            f"week={meta.get('week','?')} source={meta.get('source_path','?')} | {text}"
+            f"week={meta.get('week','?')} source={meta.get('source_path','?')} "
+            f"text_rerank_score={float(hit.get('text_rerank_score', hit.get('score', 0.0))):.4f} | {text}"
         )
 
-    if get_settings().rag_mode == RAGPipelineMode.TEXT_ONLY:
-        lines.append("IMAGE_HITS: disabled in text_only mode")
-        return "\n".join(lines)
-
-    image_hits = get_image_index().search(query, k=max(1, top_k_image))
     lines.append("IMAGE_HITS:")
-    for i, hit in enumerate(image_hits[:top_k_image], start=1):
+    for i, hit in enumerate(image_hits[: max(1, top_k_image)], start=1):
         lines.append(
             f"{i}. path={hit.get('relative_path') or hit.get('filename')} "
             f"course={hit.get('course','?')} doc_id={hit.get('doc_id','?')} page={hit.get('page_number',0)} "
-            f"distance={float(hit.get('distance', 0.0)):.3f}"
+            f"distance={float(hit.get('distance', 0.0)):.3f} "
+            f"visual_rerank_score={float(hit.get('visual_rerank_score', 0.0)):.4f}"
         )
     return "\n".join(lines)
 
@@ -997,6 +1063,7 @@ THEME_TO_PAPERS = {
 
 
 def _latest_user_text(messages: list[BaseMessage]) -> str:
+    """Walk backwards through messages to find the most recent user message (query)."""
     for m in reversed(messages):
         if isinstance(m, HumanMessage):
             return str(m.content)
@@ -1004,6 +1071,7 @@ def _latest_user_text(messages: list[BaseMessage]) -> str:
 
 
 def _latest_ai_message(messages: list[BaseMessage]) -> AIMessage | None:
+    """Walk backwards through messages to find the most recent AI message (answer)."""
     for m in reversed(messages):
         if isinstance(m, AIMessage):
             return m
@@ -1042,18 +1110,71 @@ def _format_tool_sequence(tool_calls: list[dict[str, Any]]) -> str:
     return " -> ".join(str(call.get("name", "")) for call in tool_calls)
 
 
-def _extract_tool_evidence(messages: list[BaseMessage]) -> list[str]:
-    evidence: list[str] = []
-    for m in messages:
-        if getattr(m, "type", None) != "tool":
+def _normalize_tool_calls(raw_calls: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Normalize tool call dicts so ToolNode can execute them reliably."""
+    out: list[dict[str, Any]] = []
+    for call in raw_calls or []:
+        name = str(call.get("name", "")).strip()
+        if not name:
             continue
-        text = str(getattr(m, "content", "")).strip().replace("\n", " ")
-        if not text:
-            continue
-        if len(text) > 280:
-            text = text[:280].rstrip() + "..."
-        evidence.append(text)
-    return evidence
+
+        raw_args = call.get("args", {})
+        args: dict[str, Any]
+        if isinstance(raw_args, str):
+            try:
+                parsed = json.loads(raw_args)
+                args = parsed if isinstance(parsed, dict) else {}
+            except json.JSONDecodeError:
+                args = {}
+        elif isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            args = {}
+
+        out.append(
+            {
+                "id": str(call.get("id") or f"call_{uuid4().hex[:8]}"),
+                "name": name,
+                "args": args,
+            }
+        )
+    return out
+
+
+def _build_agent_system_prompt(state: AgentState) -> str:
+    capability = str(state.get("capability", "course_grounded_qa"))
+    retrieval_plan = str(state.get("retrieval_plan", "text_only"))
+    retrieval_sources = [str(x) for x in state.get("retrieval_sources", [])]
+    external_theme_filter = str(state.get("external_theme_filter", "none"))
+    verification_report = state.get("verification_report", {}) or {}
+    verify_status = str(verification_report.get("status", "pass"))
+    verify_notes = str(verification_report.get("notes", ""))
+
+    revision_note = ""
+    if verify_status == "revise" and verify_notes:
+        revision_note = f"\nVerifier note: {verify_notes}\nRevise your previous answer and include explicit citations.\n"
+
+    return (
+        "You are a personalized multimodal study-planner assistant with tools.\n"
+        "Call tools whenever retrieval evidence is needed.\n"
+        "After tool results are available, produce a concise final answer grounded only in evidence.\n"
+        "Never invent citations.\n"
+        f"Capability: {capability}\n"
+        f"Retrieval plan: {retrieval_plan}\n"
+        f"Retrieval sources: {', '.join(retrieval_sources) or 'none'}\n"
+        f"External theme filter: {external_theme_filter or 'none'}\n"
+        f"{revision_note}"
+    )
+
+
+def _collect_trailing_tool_outputs(messages: list[BaseMessage]) -> list[str]:
+    tool_outputs: list[str] = []
+    for message in reversed(messages):
+        if getattr(message, "type", None) != "tool":
+            break
+        tool_outputs.append(str(getattr(message, "content", "")))
+    tool_outputs.reverse()
+    return tool_outputs
 
 
 def query_router_node(state: AgentState):
@@ -1107,113 +1228,47 @@ def retrieval_planner_node(state: AgentState):
     }
 
 
-def tool_selector_node(state: AgentState):
-    capability = str(state.get("capability", "course_grounded_qa"))
-    query = str(state.get("query_text", "") or _latest_user_text(state.get("messages", [])))
+def agent_node(state: AgentState):
+    messages = list(state["messages"])
+    user_query = str(state.get("query_text", "") or _latest_user_text(messages))
+    system_prompt = _build_agent_system_prompt(state)
 
-    tool_calls: list[dict[str, Any]] = []
+    if messages and getattr(messages[-1], "type", None) == "tool":
+        tool_results = _collect_trailing_tool_outputs(messages)
+        non_tool_messages = [m for m in messages if getattr(m, "type", None) != "tool"]
+        invoke_messages: list[BaseMessage] = non_tool_messages + [
+            SystemMessage(
+                content=(
+                    f"{system_prompt}\n"
+                    "Tool results are now available. Answer the user directly from those results.\n"
+                    "Do not call more tools in this turn."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f'Original user query: "{user_query}"\n'
+                    "Tool results:\n"
+                    + "\n\n".join(tool_results)
+                )
+            ),
+        ]
+    else:
+        invoke_messages = messages + [SystemMessage(content=system_prompt)]
 
-    def add_call(name: str, args: dict[str, Any]) -> None:
-        tool_calls.append({"id": f"call_{uuid4().hex[:8]}", "name": name, "args": args})
-
-    if capability == "course_grounded_qa":
-        add_call("kb_course_qa_retrieve", {"query": query, "top_k": 6, "course_filter": ""})
-    elif capability == "weekly_study_plan":
-        add_call("kb_weekly_plan_context", {"course_filters": "", "week_range": "", "top_k": 8})
-        add_call(
-            "kb_external_paper_retrieve",
-            {
-                "query": query,
-                "theme_filter": "task-prioritization,cognitive-load,energy-focus",
-                "paper_ids": "",
-                "top_k": 3,
-            },
-        )
-    elif capability == "image_to_task_extraction":
-        add_call("kb_image_task_extract", {"image_refs": query, "extraction_mode": "planner_todo"})
-    elif capability == "multimodal_retrieval_assistant":
-        add_call("kb_multimodal_retrieve", {"query": query, "top_k_text": 6, "top_k_image": 4})
-    elif capability == "research_grounded_planning_coach":
-        add_call(
-            "kb_external_paper_retrieve",
-            {
-                "query": query,
-                "theme_filter": str(state.get("external_theme_filter", "")),
-                "paper_ids": "",
-                "top_k": 3,
-            },
-        )
-        add_call("kb_weekly_plan_context", {"course_filters": "", "week_range": "", "top_k": 6})
-    elif capability == "blocked_strategy_recommender":
-        block_type = _detect_block_type(query)
-        add_call("kb_blocked_intervention_lookup", {"block_type": block_type})
-        blocked_papers = ",".join(_BLOCKED_INTERVENTIONS.get(block_type, _BLOCKED_INTERVENTIONS["priority_reset"])["papers"])
-        add_call(
-            "kb_external_paper_retrieve",
-            {
-                "query": query,
-                "theme_filter": "",
-                "paper_ids": blocked_papers,
-                "top_k": 2,
-            },
-        )
-
-    if not tool_calls:
-        return {
-            "selected_tools": [],
-            "tool_sequence": "none",
-            "skip_reason": "No tool required",
-        }
-
-    ai = AIMessage(
-        content=f"TOOL_SEQUENCE: {_format_tool_sequence(tool_calls)}",
-        tool_calls=tool_calls,
-    )
+    planner_response = get_llm().invoke(invoke_messages)
+    tool_calls = _normalize_tool_calls(getattr(planner_response, "tool_calls", []))
+    ai_content = _render_assistant_content(getattr(planner_response, "content", "")).strip()
+    ai = AIMessage(content=ai_content, tool_calls=tool_calls) if tool_calls else AIMessage(content=ai_content)
     return {
         "messages": state["messages"] + [ai],
         "selected_tools": tool_calls,
         "tool_sequence": _format_tool_sequence(tool_calls),
-        "skip_reason": "",
+        "skip_reason": "" if tool_calls else "Agent returned final answer without tool call",
+        "draft_response": ai_content if not tool_calls else "",
     }
 
 
 tool_executor_node = ToolNode(TOOLS)
-
-
-def task_decomposer_node(state: AgentState):
-    capability = str(state.get("capability", "course_grounded_qa"))
-    raw_tool_evidence = _extract_tool_evidence(state.get("messages", []))
-    tool_run_status = "success" if raw_tool_evidence else ("empty" if state.get("tool_sequence", "none") != "none" else "skipped")
-    templates = {
-        "course_grounded_qa": "1) answer directly 2) cite KB evidence",
-        "weekly_study_plan": "1) build weekly blocks 2) balance difficulty/cognitive load 3) cite support",
-        "image_to_task_extraction": "1) list extracted tasks 2) rank priorities 3) note assumptions",
-        "multimodal_retrieval_assistant": "1) return best matches 2) explain why these 3) cite page/doc ids",
-        "research_grounded_planning_coach": "1) recommendation 2) why it works 3) supporting papers",
-        "blocked_strategy_recommender": "1) detect block 2) suggest 10-20 min intervention 3) next action + citation",
-    }
-    unresolved_gaps = []
-    if state.get("tool_sequence", "none") != "none" and not raw_tool_evidence:
-        unresolved_gaps.append("Tool execution returned no evidence.")
-
-    return {
-        "tool_run_status": tool_run_status,
-        "raw_tool_evidence": raw_tool_evidence,
-        "response_tasks": templates.get(capability, templates["course_grounded_qa"]),
-        "must_include": ["citations"],
-        "unresolved_gaps": unresolved_gaps,
-    }
-
-
-def evidence_formatter_node(state: AgentState):
-    evidence_lines: list[str] = []
-    for idx, content in enumerate(state.get("raw_tool_evidence", [])[:8], start=1):
-        evidence_lines.append(f"- [tool_{idx}] {content}")
-
-    if not evidence_lines:
-        evidence_lines = ["- [none] No tool evidence available."]
-
-    return {"evidence_block": "EVIDENCE_BLOCK_START\n" + "\n".join(evidence_lines) + "\nEVIDENCE_BLOCK_END"}
 
 
 # =========================
@@ -1250,12 +1305,7 @@ def build_llm(settings: Settings):
     return _build_base_llm(settings).bind_tools(TOOLS)
 
 
-def build_plain_llm(settings: Settings):
-    return _build_base_llm(settings)
-
-
 _LLM = None
-_PLAIN_LLM = None
 
 
 def get_llm():
@@ -1263,49 +1313,6 @@ def get_llm():
     if _LLM is None:
         _LLM = build_llm(get_settings())
     return _LLM
-
-
-def get_plain_llm():
-    global _PLAIN_LLM
-    if _PLAIN_LLM is None:
-        _PLAIN_LLM = build_plain_llm(get_settings())
-    return _PLAIN_LLM
-
-
-def answer_synthesizer_node(state: AgentState):
-    capability = str(state.get("capability", "course_grounded_qa"))
-    query = str(state.get("query_text", "") or _latest_user_text(state.get("messages", [])))
-    evidence = str(state.get("evidence_block", "EVIDENCE_BLOCK_START\n- [none] no evidence\nEVIDENCE_BLOCK_END"))
-    response_tasks = str(state.get("response_tasks", "answer + citations"))
-    verification_report = state.get("verification_report", {}) or {}
-    verify_status = str(verification_report.get("status", "pass"))
-    verify_notes = str(verification_report.get("notes", ""))
-
-    revise_instruction = ""
-    if verify_status == "revise" and verify_notes:
-        revise_instruction = f"\nRevision note from verifier: {verify_notes}\n"
-
-    system_prompt = (
-        "You are a personalized multimodal study-planner assistant.\n"
-        "Write concise, actionable answers.\n"
-        "Follow the capability-specific format exactly.\n"
-        "Never invent citations.\n"
-    )
-    human_prompt = (
-        f"Capability: {capability}\n"
-        f"User query: {query}\n"
-        f"Required response tasks: {response_tasks}\n"
-        f"Must include: {', '.join(state.get('must_include', [])) or 'none'}\n"
-        f"Unresolved gaps: {', '.join(state.get('unresolved_gaps', [])) or 'none'}\n"
-        f"{evidence}\n"
-        f"{revise_instruction}"
-        "Return only the final user-facing response."
-    )
-    response = get_plain_llm().invoke([SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)])
-    return {
-        "messages": state["messages"] + [response],
-        "draft_response": _render_assistant_content(response.content),
-    }
 
 
 def verification_node(state: AgentState):
@@ -1355,10 +1362,10 @@ def verification_node(state: AgentState):
     }
 
 
-def route_after_tool_selector(state: AgentState):
+def route_after_agent(state: AgentState):
     if str(state.get("tool_sequence", "none")) != "none":
         return "tool_executor"
-    return "task_decomposer"
+    return "verification"
 
 
 def route_after_verification(state: AgentState):
@@ -1375,29 +1382,23 @@ graph = StateGraph(AgentState)
 graph.add_node("query_router", query_router_node)
 graph.add_node("capability_router", capability_router_node)
 graph.add_node("retrieval_planner", retrieval_planner_node)
-graph.add_node("tool_selector", tool_selector_node)
+graph.add_node("agent", agent_node)
 graph.add_node("tool_executor", tool_executor_node)
-graph.add_node("task_decomposer", task_decomposer_node)
-graph.add_node("evidence_formatter", evidence_formatter_node)
-graph.add_node("answer_synthesizer", answer_synthesizer_node)
 graph.add_node("verification", verification_node)
 graph.set_entry_point("query_router")
 graph.add_edge("query_router", "capability_router")
 graph.add_edge("capability_router", "retrieval_planner")
-graph.add_edge("retrieval_planner", "tool_selector")
+graph.add_edge("retrieval_planner", "agent")
 graph.add_conditional_edges(
-    "tool_selector",
-    route_after_tool_selector,
-    {"tool_executor": "tool_executor", "task_decomposer": "task_decomposer"},
+    "agent",
+    route_after_agent,
+    {"tool_executor": "tool_executor", "verification": "verification"},
 )
-graph.add_edge("tool_executor", "task_decomposer")
-graph.add_edge("task_decomposer", "evidence_formatter")
-graph.add_edge("evidence_formatter", "answer_synthesizer")
-graph.add_edge("answer_synthesizer", "verification")
+graph.add_edge("tool_executor", "agent")
 graph.add_conditional_edges(
     "verification",
     route_after_verification,
-    {"revise": "answer_synthesizer", "pass": END, "abstain": END},
+    {"revise": "agent", "pass": END, "abstain": END},
 )
 
 app = graph.compile()
