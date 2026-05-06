@@ -59,6 +59,7 @@ class Settings:
     visual_rerank_top_n: int
     multimodal_fusion_alpha: float
     multimodal_fusion_k: int
+    course_filter_enabled: bool
 
 
 def _int_env(name: str, default: int) -> int:
@@ -103,7 +104,6 @@ def load_settings() -> Settings:
     text_context_mode = (os.environ.get("TEXT_CONTEXT_MODE") or "metadata").strip().lower()
     if text_context_mode not in {"none", "metadata"}:
         text_context_mode = "metadata"
-
     return Settings(
         llm_backend=LLMBackend.GEMINI,
         gemini_model=(os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip(),
@@ -132,4 +132,5 @@ def load_settings() -> Settings:
         visual_rerank_top_n=_int_env("VISUAL_RERANK_TOP_N", 8),
         multimodal_fusion_alpha=_float_env("MULTIMODAL_FUSION_ALPHA", 0.7, 0.0, 1.0),
         multimodal_fusion_k=_int_env("MULTIMODAL_FUSION_K", 8),
+        course_filter_enabled=_bool_env("COURSE_FILTER_ENABLED", True),
     )

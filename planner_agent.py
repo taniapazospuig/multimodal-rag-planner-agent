@@ -154,125 +154,66 @@ class OpenCLIPBackbone:
         return emb
 
 
-def _infer_slug_from_course_row(course: dict) -> str | None:
-    """Best-effort slug aligned with chunk `course` metadata (see chunks_recursive.jsonl)."""
-    for key in ("course", "slug", "id"):
-        raw = str(course.get(key) or "").strip()
-        if raw and re.match(r"^[a-z0-9]+(?:-[a-z0-9]+)*$", raw.lower()):
-            return raw.lower()
-    title = str(course.get("title", "")).lower()
-    if "operations" in title and "research" in title:
-        return "operations-research"
-    if ("high" in title and "dim" in title) or "high-dimensional" in title.replace(" ", "-"):
-        return "high-dimensional-data"
-    if "generative" in title:
-        return "generative-ai"
-    return None
+def _normalize_for_match(text: str) -> str:
+    text = text.lower().strip()
+    text = text.replace("&", " and ")
+    text = re.sub(r"[^\w\s-]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _term_in_query(term: str, normalized_query: str) -> bool:
+    if not term:
+        return False
+    # Short tokens should match as whole words (e.g. HDD, COMP2701).
+    if len(term) <= 4 and " " not in term:
+        return re.search(rf"\b{re.escape(term)}\b", normalized_query) is not None
+    return term in normalized_query
 
 
 def _course_filter_candidates(query: str) -> list[tuple[str, int]]:
-    """Return (slug, score) pairs; higher score = stronger evidence. Used to pick a clear winner."""
-    low = query.lower()
+    """Return (course, score) pairs from catalog matches."""
+    normalized_query = _normalize_for_match(query)
     scores: dict[str, int] = defaultdict(int)
 
-    def add(slug: str, weight: int) -> None:
-        scores[slug] += weight
-
-    # Strong: explicit chunk / path slugs (user paste, folder paths).
-    for slug in ("operations-research", "high-dimensional-data", "generative-ai"):
-        if slug in low:
-            add(slug, 4)
-
-    # Catalog: course codes and full titles from courses.csv (if present).
     for course in COURSES:
-        slug = _infer_slug_from_course_row(course)
+        slug = str(course.get("course", "")).strip().lower()
         if not slug:
             continue
-        code = str(course.get("code", "")).lower().strip()
-        if code and len(code) >= 3 and code in low:
-            add(slug, 5)
-        title = str(course.get("title", "")).lower().strip()
-        if len(title) >= 5 and title in low:
-            add(slug, 5)
-        if title:
-            # Short title tokens (e.g. "COMP2701" already handled; multi-word partials).
-            parts = [p for p in re.split(r"[^\w]+", title) if len(p) >= 4]
-            hits = sum(1 for p in parts if p in low)
-            if hits >= 2:
-                add(slug, 3)
 
-    # Phrase / synonym heuristics (weight 2 so catalog/slug beats weak overlaps).
-    heuristics: list[tuple[str, tuple[str, ...]]] = [
-        (
-            "operations-research",
-            (
-                "operations research",
-                "linear programming",
-                "integer programming",
-                "simplex method",
-                "inventory theory",
-                "queueing theory",
-                "queuing theory",
-                "network flow",
-                "transportation problem",
-                "assignment problem",
-            ),
-        ),
-        (
-            "high-dimensional-data",
-            (
-                "high dimensional data",
-                "high-dimensional data",
-                "high dimensional statistics",
-                "high dim data",
-                "high-dim data",
-                "curse of dimensionality",
-                "dimensionality reduction",
-                "manifold learning",
-            ),
-        ),
-        (
-            "generative-ai",
-            (
-                "generative ai",
-                "gen ai",
-                "genai",
-                "diffusion model",
-                "variational autoencoder",
-                "vae ",
-                " gan ",
-                "large language model",
-                "llm ",
-                "rag system",
-                "retrieval augmented",
-            ),
-        ),
-    ]
-    for slug, phrases in heuristics:
-        for ph in phrases:
-            if ph.strip() in low:
-                add(slug, 2)
-                break
+        code = _normalize_for_match(str(course.get("code", "")))
+        if code and _term_in_query(code, normalized_query):
+            scores[slug] += 5
 
-    # Token shortcuts (narrow: require word boundary via padded string for short tokens).
-    padded = f" {low} "
-    if re.search(r"\bhdd\b", padded):
-        add("high-dimensional-data", 2)
-    if re.search(r"\bcomp\s*2701\b", padded):
-        add("generative-ai", 4)
+        title = _normalize_for_match(str(course.get("title", "")))
+        if len(title) >= 5 and _term_in_query(title, normalized_query):
+            scores[slug] += 5
+
+        aliases_raw = str(course.get("aliases", "")).strip()
+        if aliases_raw:
+            for alias in aliases_raw.split("|"):
+                alias_norm = _normalize_for_match(alias)
+                if alias_norm and _term_in_query(alias_norm, normalized_query):
+                    scores[slug] += 3
+                    break
 
     ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
     return ranked
 
 
-def _detect_course_filter(query: str) -> str | None:
+def _detect_course_filter(
+    query: str,
+    enabled: bool = True,
+) -> str | None:
+    if not enabled:
+        return None
     ranked = _course_filter_candidates(query)
     if not ranked:
         return None
     best_slug, best_score = ranked[0]
     second = ranked[1][1] if len(ranked) > 1 else 0
-    # Require a winner; avoid filtering on a one-point tie with another course.
-    if best_score >= 2 and best_score > second:
+    # Apply only when confidence is strong enough to avoid over-filtering.
+    if best_score >= 5 and (best_score - second) >= 2:
         return best_slug
     return None
 
@@ -374,7 +315,10 @@ class HybridTextRetriever:
         return out
 
     def search(self, query: str, k: int | None = None) -> list[dict]:
-        course_filter = _detect_course_filter(query)
+        course_filter = _detect_course_filter(
+            query,
+            enabled=self.settings.course_filter_enabled,
+        )
         where = {"course": course_filter} if course_filter else None
 
         dense_ids = self._dense_search(query, where=where)
