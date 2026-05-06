@@ -60,6 +60,8 @@ class Settings:
     multimodal_fusion_alpha: float
     multimodal_fusion_k: int
     course_filter_enabled: bool
+    mllm_max_images: int
+    mllm_max_image_edge: int
 
 
 def _int_env(name: str, default: int) -> int:
@@ -133,4 +135,6 @@ def load_settings() -> Settings:
         multimodal_fusion_alpha=_float_env("MULTIMODAL_FUSION_ALPHA", 0.7, 0.0, 1.0),
         multimodal_fusion_k=_int_env("MULTIMODAL_FUSION_K", 8),
         course_filter_enabled=_bool_env("COURSE_FILTER_ENABLED", True),
+        mllm_max_images=_int_env("MLLM_MAX_IMAGES", 4),
+        mllm_max_image_edge=_int_env("MLLM_MAX_IMAGE_EDGE", 1280),
     )

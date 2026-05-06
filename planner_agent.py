@@ -8,6 +8,8 @@ structured typed AgentState handoffs between nodes.
 from __future__ import annotations
 
 import csv
+import base64
+import io
 import json
 import re
 import warnings
@@ -33,6 +35,69 @@ from text_tokenization import LexicalTokenizerConfig, tokenize_for_bm25
 
 warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
 warnings.filterwarnings("ignore", category=FutureWarning, module="google")
+
+_MMLM_PAYLOAD_PREFIX = "__MMLM_PAYLOAD__="
+
+
+def _collect_existing_image_paths(payload: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    for key in ("text_linked_images", "retrieved_image_hits"):
+        rows = payload.get(key, [])
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            rel = str(row.get("relative_path", "")).strip()
+            if not rel:
+                continue
+            abs_path = _BASE_DIR / rel
+            if abs_path.exists():
+                paths.append(str(abs_path))
+    return paths
+
+
+def _extract_tool_payloads(raw_outputs: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+    cleaned_outputs: list[str] = []
+    payloads: list[dict[str, Any]] = []
+    for output in raw_outputs:
+        cleaned_lines: list[str] = []
+        for line in output.splitlines():
+            if line.startswith(_MMLM_PAYLOAD_PREFIX):
+                raw_payload = line[len(_MMLM_PAYLOAD_PREFIX):].strip()
+                try:
+                    payload = json.loads(raw_payload)
+                    if isinstance(payload, dict):
+                        payloads.append(payload)
+                except json.JSONDecodeError:
+                    cleaned_lines.append(line)
+            else:
+                cleaned_lines.append(line)
+        cleaned_outputs.append("\n".join(cleaned_lines).strip())
+    return cleaned_outputs, payloads
+
+
+def _encode_image_as_data_url(path: str, max_edge: int) -> str | None:
+    image_path = Path(path)
+    if not image_path.exists():
+        return None
+    try:
+        with Image.open(image_path) as opened:
+            image = opened.convert("RGB")
+            width, height = image.size
+            if max(width, height) > max_edge:
+                scale = max_edge / float(max(width, height))
+                resized = (
+                    max(1, int(width * scale)),
+                    max(1, int(height * scale)),
+                )
+                image = image.resize(resized, Image.Resampling.LANCZOS)
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+    except Exception:
+        return None
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
 
 
 # =========================
@@ -744,6 +809,10 @@ def get_image_index() -> ImageIndex:
     return _IMAGE_INDEX
 
 
+def _append_mllm_payload(lines: list[str], payload: dict[str, Any]) -> None:
+    lines.append(f"{_MMLM_PAYLOAD_PREFIX}{json.dumps(payload, ensure_ascii=False)}")
+
+
 def _reranked_text_hits(
     query: str,
     final_k: int,
@@ -821,6 +890,23 @@ def kb_multimodal_retrieve(query: str, top_k_text: int = 6, top_k_image: int = 4
     text_hits = get_text_reranker().rerank(query=query, hits=text_stage1_hits, top_k=text_candidate_k)
 
     lines = ["MULTIMODAL_EVIDENCE:"]
+    text_linked_images: list[dict[str, Any]] = []
+    seen_text_image_paths: set[str] = set()
+    for hit in text_hits:
+        meta = hit.get("metadata", {}) or {}
+        rel = str(meta.get("page_image_path", "")).strip()
+        if not rel or rel in seen_text_image_paths:
+            continue
+        seen_text_image_paths.add(rel)
+        text_linked_images.append(
+            {
+                "relative_path": rel,
+                "doc_id": str(meta.get("doc_id", "")),
+                "unit_id": str(meta.get("unit_id", "")),
+                "course": str(meta.get("course", "")),
+                "week": str(meta.get("week", "")),
+            }
+        )
 
     if settings.rag_mode == RAGPipelineMode.TEXT_ONLY:
         lines.append("MODE: text_only (image retrieval disabled)")
@@ -835,6 +921,49 @@ def kb_multimodal_retrieve(query: str, top_k_text: int = 6, top_k_image: int = 4
                 f"week={meta.get('week','?')} source={meta.get('source_path','?')} "
                 f"text_rerank_score={float(hit.get('text_rerank_score', hit.get('score', 0.0))):.4f} | {text}"
             )
+        _append_mllm_payload(
+            lines,
+            {
+                "tool": "kb_multimodal_retrieve",
+                "mode": settings.rag_mode.value,
+                "retrieval_sources": ["text"],
+                "text_linked_images": [],
+                "retrieved_image_hits": [],
+            },
+        )
+        return "\n".join(lines)
+
+    if settings.rag_mode == RAGPipelineMode.TEXT_RETRIEVAL_MLLM:
+        lines.append("MODE: text_retrieval_mllm (image retrieval disabled; MLLM can inspect text-linked images)")
+        lines.append("TEXT_HITS:")
+        for i, hit in enumerate(text_hits[: max(1, top_k_text)], start=1):
+            meta = hit.get("metadata", {})
+            text = str(hit.get("text", "")).replace("\n", " ").strip()
+            if len(text) > 170:
+                text = text[:170].rstrip() + "..."
+            lines.append(
+                f"{i}. [{meta.get('course','?')}|{meta.get('doc_id','?')}] "
+                f"week={meta.get('week','?')} source={meta.get('source_path','?')} "
+                f"text_rerank_score={float(hit.get('text_rerank_score', hit.get('score', 0.0))):.4f} | {text}"
+            )
+        if text_linked_images:
+            lines.append("TEXT_LINKED_IMAGES:")
+            for i, image in enumerate(text_linked_images[: max(1, top_k_image)], start=1):
+                lines.append(
+                    f"{i}. path={image.get('relative_path')} "
+                    f"doc_id={image.get('doc_id','?')} unit_id={image.get('unit_id','?')} "
+                    f"course={image.get('course','?')} week={image.get('week','?')}"
+                )
+        _append_mllm_payload(
+            lines,
+            {
+                "tool": "kb_multimodal_retrieve",
+                "mode": settings.rag_mode.value,
+                "retrieval_sources": ["text"],
+                "text_linked_images": text_linked_images[: max(1, top_k_image)],
+                "retrieved_image_hits": [],
+            },
+        )
         return "\n".join(lines)
 
     image_candidate_k = max(1, top_k_image, settings.visual_rerank_top_n)
@@ -891,6 +1020,29 @@ def kb_multimodal_retrieve(query: str, top_k_text: int = 6, top_k_image: int = 4
             f"distance={float(hit.get('distance', 0.0)):.3f} "
             f"visual_rerank_score={float(hit.get('visual_rerank_score', 0.0)):.4f}"
         )
+    retrieved_image_hits = []
+    for hit in image_hits[: max(1, top_k_image)]:
+        rel = str(hit.get("relative_path", "")).strip()
+        if not rel:
+            continue
+        retrieved_image_hits.append(
+            {
+                "relative_path": rel,
+                "doc_id": str(hit.get("doc_id", "")),
+                "page_number": int(hit.get("page_number", 0) or 0),
+                "course": str(hit.get("course", "")),
+            }
+        )
+    _append_mllm_payload(
+        lines,
+        {
+            "tool": "kb_multimodal_retrieve",
+            "mode": settings.rag_mode.value,
+            "retrieval_sources": ["text", "image", "fused"],
+            "text_linked_images": text_linked_images[: max(1, top_k_image)],
+            "retrieved_image_hits": retrieved_image_hits,
+        },
+    )
     return "\n".join(lines)
 
 
@@ -916,6 +1068,25 @@ def kb_image_task_extract(image_refs: str, extraction_mode: str = "planner_todo"
             f"{i}. task=Review item from {source} "
             f"priority={priority} course={course} page={page} citation=[{hit.get('doc_id','?')}]"
         )
+    _append_mllm_payload(
+        lines,
+        {
+            "tool": "kb_image_task_extract",
+            "mode": get_settings().rag_mode.value,
+            "retrieval_sources": ["image"],
+            "text_linked_images": [],
+            "retrieved_image_hits": [
+                {
+                    "relative_path": str(hit.get("relative_path", "")).strip(),
+                    "doc_id": str(hit.get("doc_id", "")),
+                    "page_number": int(hit.get("page_number", 0) or 0),
+                    "course": str(hit.get("course", "")),
+                }
+                for hit in image_hits
+                if str(hit.get("relative_path", "")).strip()
+            ],
+        },
+    )
     return "\n".join(lines)
 
 
@@ -1133,15 +1304,140 @@ def _collect_trailing_tool_outputs(messages: list[BaseMessage]) -> list[str]:
     return tool_outputs
 
 
+def _build_post_tool_text_prompt(user_query: str, tool_results_text: list[str]) -> str:
+    return (
+        f'Original user query: "{user_query}"\n'
+        "Tool results:\n"
+        + "\n\n".join(tool_results_text)
+    )
+
+
+def _build_multimodal_human_content(
+    user_query: str,
+    tool_results_text: list[str],
+    payloads: list[dict[str, Any]],
+    settings: Settings,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rag_mode = settings.rag_mode
+    retrieval_sources: set[str] = set()
+    candidate_paths = _select_candidate_image_paths(payloads=payloads, rag_mode=rag_mode)
+    for payload in payloads:
+        sources = payload.get("retrieval_sources", [])
+        if isinstance(sources, list):
+            retrieval_sources.update(str(s) for s in sources if str(s).strip())
+
+    unique_paths: list[str] = []
+    seen_paths: set[str] = set()
+    for path in candidate_paths:
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        unique_paths.append(path)
+
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": _build_post_tool_text_prompt(user_query, tool_results_text),
+        }
+    ]
+    attached = 0
+    failed_paths: list[str] = []
+    max_images = max(1, settings.mllm_max_images)
+    max_edge = max(256, settings.mllm_max_image_edge)
+    for image_path in unique_paths[:max_images]:
+        data_url = _encode_image_as_data_url(image_path, max_edge=max_edge)
+        if not data_url:
+            failed_paths.append(image_path)
+            continue
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": data_url,
+            }
+        )
+        attached += 1
+
+    trace = {
+        "mode": rag_mode.value,
+        "retrieval_sources": sorted(retrieval_sources),
+        "attached_images": attached,
+        "failed_images": len(failed_paths),
+    }
+    if failed_paths:
+        content[0]["text"] += "\n\nImage attachment warnings:\n" + "\n".join(
+            f"- failed_to_load: {Path(path).as_posix()}" for path in failed_paths
+        )
+    return content, trace
+
+
+def _select_candidate_image_paths(
+    payloads: list[dict[str, Any]],
+    rag_mode: RAGPipelineMode,
+) -> list[str]:
+    candidate_paths: list[str] = []
+    for payload in payloads:
+        if rag_mode == RAGPipelineMode.TEXT_RETRIEVAL_MLLM:
+            rows = payload.get("text_linked_images", [])
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict):
+                        rel = str(row.get("relative_path", "")).strip()
+                        if rel:
+                            abs_path = _BASE_DIR / rel
+                            if abs_path.exists():
+                                candidate_paths.append(str(abs_path))
+        elif rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM:
+            candidate_paths.extend(_collect_existing_image_paths(payload))
+    unique_paths: list[str] = []
+    seen_paths: set[str] = set()
+    for path in candidate_paths:
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        unique_paths.append(path)
+    return unique_paths
+
+
+def run_ablation_mode_sanity_checks() -> dict[str, Any]:
+    """Lightweight checks for image selection behavior across ablation modes."""
+    sample_payload = {
+        "retrieval_sources": ["text", "image", "fused"],
+        "text_linked_images": [
+            {"relative_path": "data/kb/01_processed/rendered/pdf_pages/doc_001/page_0001.png"}
+        ],
+        "retrieved_image_hits": [
+            {"relative_path": "data/kb/01_processed/rendered/pdf_pages/doc_001/page_0002.png"}
+        ],
+    }
+    payloads = [sample_payload]
+    out = {
+        "text_only_count": len(_select_candidate_image_paths(payloads, RAGPipelineMode.TEXT_ONLY)),
+        "text_retrieval_mllm_count": len(
+            _select_candidate_image_paths(payloads, RAGPipelineMode.TEXT_RETRIEVAL_MLLM)
+        ),
+        "multimodal_retrieval_mllm_count": len(
+            _select_candidate_image_paths(payloads, RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM)
+        ),
+    }
+    out["pass"] = (
+        out["text_only_count"] == 0
+        and out["text_retrieval_mllm_count"] >= 1
+        and out["multimodal_retrieval_mllm_count"] >= out["text_retrieval_mllm_count"]
+    )
+    return out
+
+
 def agent_node(state: AgentState):
     messages = list(state["messages"])
     user_query = _latest_user_text(messages)
     system_prompt = _build_agent_system_prompt(state)
 
     if messages and getattr(messages[-1], "type", None) == "tool":
-        tool_results = _collect_trailing_tool_outputs(messages)
+        raw_tool_results = _collect_trailing_tool_outputs(messages)
+        tool_results, payloads = _extract_tool_payloads(raw_tool_results)
         non_tool_messages = [m for m in messages if getattr(m, "type", None) != "tool"]
-        invoke_messages: list[BaseMessage] = non_tool_messages + [
+        settings = get_settings()
+        invoke_messages = non_tool_messages + [
             SystemMessage(
                 content=(
                     f"{system_prompt}\n"
@@ -1149,14 +1445,20 @@ def agent_node(state: AgentState):
                     "Do not call more tools in this turn."
                 )
             ),
-            HumanMessage(
-                content=(
-                    f'Original user query: "{user_query}"\n'
-                    "Tool results:\n"
-                    + "\n\n".join(tool_results)
-                )
-            ),
         ]
+        if settings.rag_mode == RAGPipelineMode.TEXT_ONLY:
+            trace = {"mode": settings.rag_mode.value, "retrieval_sources": ["text"], "attached_images": 0}
+            print(f"[AblationTrace] {json.dumps(trace)}")
+            invoke_messages.append(HumanMessage(content=_build_post_tool_text_prompt(user_query, tool_results)))
+        else:
+            mm_content, trace = _build_multimodal_human_content(
+                user_query=user_query,
+                tool_results_text=tool_results,
+                payloads=payloads,
+                settings=settings,
+            )
+            print(f"[AblationTrace] {json.dumps(trace)}")
+            invoke_messages.append(HumanMessage(content=mm_content))
     else:
         invoke_messages = messages + [SystemMessage(content=system_prompt)]
 
