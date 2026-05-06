@@ -1,9 +1,8 @@
 """
 Personal multimodal planner agent.
 
-Graph is node-first (router -> capability -> retrieval planner -> tool selector ->
-optional tool execution -> decomposition -> evidence formatting -> synthesis ->
-verification), with structured typed AgentState handoffs between nodes.
+Graph is LLM-first (agent -> optional tool execution -> verification) with
+structured typed AgentState handoffs between nodes.
 """
 
 from __future__ import annotations
@@ -43,51 +42,23 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="google")
 
 class AgentState(TypedDict):
     messages: List[BaseMessage]
-    query_text: str
-    route_intent: str
-    route_confidence: str
-    capability: str
-    capability_reason: str
-    retrieval_plan: str
-    retrieval_sources: list[str]
-    external_theme_filter: str
     required_citations: bool
     selected_tools: list[dict[str, Any]]
     tool_sequence: str
     skip_reason: str
-    tool_run_status: str
-    raw_tool_evidence: list[str]
-    response_tasks: str
-    must_include: list[str]
-    unresolved_gaps: list[str]
-    evidence_block: str
     draft_response: str
     verification_report: dict[str, Any]
     verify_retry_count: int
 
 
 def _default_agent_state(messages: list[BaseMessage]) -> AgentState:
-    "Create a fully iniitalized AgentState dictionary with default values."
+    "Create a fully initialized AgentState dictionary with default values."
     return {
         "messages": messages,
-        "query_text": "",
-        "route_intent": "",
-        "route_confidence": "low",
-        "capability": "course_grounded_qa",
-        "capability_reason": "",
-        "retrieval_plan": "text_only",
-        "retrieval_sources": [],
-        "external_theme_filter": "",
         "required_citations": True,
         "selected_tools": [],
         "tool_sequence": "none",
         "skip_reason": "",
-        "tool_run_status": "empty",
-        "raw_tool_evidence": [],
-        "response_tasks": "",
-        "must_include": [],
-        "unresolved_gaps": [],
-        "evidence_block": "EVIDENCE_BLOCK_START\n- [none] No tool evidence available.\nEVIDENCE_BLOCK_END",
         "draft_response": "",
         "verification_report": {"status": "pass", "notes": ""},
         "verify_retry_count": 0,
@@ -1044,24 +1015,6 @@ TOOLS = [
     kb_blocked_intervention_lookup,
 ]
 
-INTENT_TO_CAPABILITY = {
-    "qa": "course_grounded_qa",
-    "weekly_plan": "weekly_study_plan",
-    "image_extract": "image_to_task_extraction",
-    "multimodal_find": "multimodal_retrieval_assistant",
-    "planning_coach": "research_grounded_planning_coach",
-    "blocked": "blocked_strategy_recommender",
-}
-THEME_TO_PAPERS = {
-    "task-prioritization": ["extp_001", "extp_002", "extp_003"],
-    "study-techniques": ["extp_004", "extp_005"],
-    "cognitive-load": ["extp_006"],
-    "energy-focus": ["extp_007", "extp_008"],
-    "recovery-strategies": ["extp_008", "extp_009"],
-    "habit-formation": ["extp_010", "extp_011"],
-}
-
-
 def _latest_user_text(messages: list[BaseMessage]) -> str:
     """Walk backwards through messages to find the most recent user message (query)."""
     for m in reversed(messages):
@@ -1076,32 +1029,6 @@ def _latest_ai_message(messages: list[BaseMessage]) -> AIMessage | None:
         if isinstance(m, AIMessage):
             return m
     return None
-
-
-def _detect_route_intent(query: str) -> tuple[str, str]:
-    low = query.lower()
-    if re.search(r"\b(stuck|overwhelmed|procrastinating|tired|burned out|blocked)\b", low):
-        return "blocked", "high"
-    if re.search(r"\b(plan|schedule|week|weekly|timetable)\b", low):
-        if re.search(r"\b(research-backed|evidence-based|why|paper)\b", low):
-            return "planning_coach", "high"
-        return "weekly_plan", "high"
-    if re.search(r"\b(extract|parse)\b", low) and re.search(r"\b(image|screenshot|handwriting|todo|planner)\b", low):
-        return "image_extract", "high"
-    if re.search(r"\b(find|where|diagram|slide|page|figure)\b", low):
-        return "multimodal_find", "medium"
-    return "qa", "medium"
-
-
-def _detect_block_type(query: str) -> str:
-    low = query.lower()
-    if re.search(r"\b(procrastinat|avoid|delay)\b", low):
-        return "priority_reset"
-    if re.search(r"\b(can't remember|forget|retention|memor)\b", low):
-        return "study_method_switch"
-    if re.search(r"\b(tired|fatigue|exhaust|drained)\b", low):
-        return "recovery_protocol"
-    return "priority_reset"
 
 
 def _format_tool_sequence(tool_calls: list[dict[str, Any]]) -> str:
@@ -1142,10 +1069,6 @@ def _normalize_tool_calls(raw_calls: list[dict[str, Any]] | None) -> list[dict[s
 
 
 def _build_agent_system_prompt(state: AgentState) -> str:
-    capability = str(state.get("capability", "course_grounded_qa"))
-    retrieval_plan = str(state.get("retrieval_plan", "text_only"))
-    retrieval_sources = [str(x) for x in state.get("retrieval_sources", [])]
-    external_theme_filter = str(state.get("external_theme_filter", "none"))
     verification_report = state.get("verification_report", {}) or {}
     verify_status = str(verification_report.get("status", "pass"))
     verify_notes = str(verification_report.get("notes", ""))
@@ -1155,14 +1078,47 @@ def _build_agent_system_prompt(state: AgentState) -> str:
         revision_note = f"\nVerifier note: {verify_notes}\nRevise your previous answer and include explicit citations.\n"
 
     return (
-        "You are a personalized multimodal study-planner assistant with tools.\n"
-        "Call tools whenever retrieval evidence is needed.\n"
-        "After tool results are available, produce a concise final answer grounded only in evidence.\n"
-        "Never invent citations.\n"
-        f"Capability: {capability}\n"
-        f"Retrieval plan: {retrieval_plan}\n"
-        f"Retrieval sources: {', '.join(retrieval_sources) or 'none'}\n"
-        f"External theme filter: {external_theme_filter or 'none'}\n"
+        "You are a personalized multimodal study-planner assistant with tool access.\n"
+        "\n"
+        "PRIMARY RULE\n"
+        "- Prefer grounded answers over fast answers.\n"
+        "- If retrieval would improve correctness, call tools first.\n"
+        "- Never invent citations or evidence.\n"
+        "\n"
+        "OUTPUT CONTRACT\n"
+        "- Final answers should be concise, practical, and evidence-grounded.\n"
+        "- Include citation identifiers from tool outputs when evidence is used (e.g., doc_###, extp_###).\n"
+        "- If evidence is insufficient, say so clearly and ask for the minimum missing detail.\n"
+        "\n"
+        "TOOL POLICY\n"
+        "- Use kb_course_qa_retrieve for course concepts, requirements, comparisons, and factual what/why/how questions.\n"
+        "- Use kb_weekly_plan_context for scheduling, weekly plans, workload balancing, sequencing, and timetables.\n"
+        "- Use kb_multimodal_retrieve for find/where requests involving slides, figures, pages, diagrams, or image-backed evidence.\n"
+        "- Use kb_image_task_extract for extracting todos/tasks from screenshots, planner images, handwritten notes, or photos.\n"
+        "- Use kb_external_paper_retrieve for research-backed/evidence-based recommendations, rationale, and paper support.\n"
+        "- Use kb_blocked_intervention_lookup when the user is blocked, overwhelmed, procrastinating, tired, burned out, or asks for next-step recovery.\n"
+        "\n"
+        "DEFAULT CALL SHAPES\n"
+        "- kb_course_qa_retrieve(query=<user_query>, top_k=6, course_filter=\"\")\n"
+        "- kb_weekly_plan_context(course_filters=\"\", week_range=\"\", top_k=8)\n"
+        "- kb_multimodal_retrieve(query=<user_query>, top_k_text=6, top_k_image=4)\n"
+        "- kb_image_task_extract(image_refs=<user_query>, extraction_mode=\"planner_todo\")\n"
+        "- kb_external_paper_retrieve(query=<user_query>, theme_filter=\"\", paper_ids=\"\", top_k=3)\n"
+        "- kb_blocked_intervention_lookup(block_type=<priority_reset|study_method_switch|recovery_protocol>)\n"
+        "\n"
+        "COMPOSITION RECIPES\n"
+        "- Planning plus rationale: call kb_weekly_plan_context, then kb_external_paper_retrieve, then synthesize one integrated plan.\n"
+        "- Multimodal explanation: call kb_multimodal_retrieve and optionally kb_course_qa_retrieve for clarification before synthesizing.\n"
+        "- Blocked support with evidence: call kb_blocked_intervention_lookup and optionally kb_external_paper_retrieve for stronger rationale.\n"
+        "\n"
+        "AMBIGUITY / NON-KB REQUESTS\n"
+        "- If the request is ambiguous and tool choice depends on missing info, ask one short clarification question.\n"
+        "- For simple chit-chat or non-KB requests that do not require factual grounding, answer directly without unnecessary tool calls.\n"
+        "\n"
+        "QUALITY GUARDRAILS\n"
+        "- Do not call irrelevant tools.\n"
+        "- Do not repeat near-identical tool calls unless broadening search after empty evidence.\n"
+        "- After tool results are available, provide the final answer from those results and do not call additional tools in that same turn.\n"
         f"{revision_note}"
     )
 
@@ -1177,60 +1133,9 @@ def _collect_trailing_tool_outputs(messages: list[BaseMessage]) -> list[str]:
     return tool_outputs
 
 
-def query_router_node(state: AgentState):
-    query = _latest_user_text(state.get("messages", []))
-    route_intent, confidence = _detect_route_intent(query)
-    return {
-        "query_text": query,
-        "route_intent": route_intent,
-        "route_confidence": confidence,
-    }
-
-
-def capability_router_node(state: AgentState):
-    route_intent = str(state.get("route_intent", "qa"))
-    capability = INTENT_TO_CAPABILITY.get(route_intent, "course_grounded_qa")
-    reason = f"mapped from route intent '{route_intent}'"
-    return {"capability": capability, "capability_reason": reason}
-
-
-def retrieval_planner_node(state: AgentState):
-    capability = str(state.get("capability", "course_grounded_qa"))
-    rag_mode = get_settings().rag_mode.value
-
-    plan = "text_plus_image" if rag_mode != RAGPipelineMode.TEXT_ONLY.value else "text_only"
-    sources = ["kb_text"]
-    external_theme = "none"
-    required_citations = "yes"
-
-    if capability == "multimodal_retrieval_assistant":
-        plan = "text_only" if rag_mode == RAGPipelineMode.TEXT_ONLY.value else "text_plus_image"
-        if plan == "text_plus_image":
-            sources.append("kb_image")
-    elif capability == "image_to_task_extraction":
-        plan = "text_only" if rag_mode == RAGPipelineMode.TEXT_ONLY.value else "text_plus_image"
-        if plan == "text_plus_image":
-            sources = ["kb_image"]
-    elif capability == "research_grounded_planning_coach":
-        plan = "external_augmented"
-        sources = ["external_papers", "kb_text"]
-        external_theme = "task-prioritization,cognitive-load,energy-focus"
-    elif capability == "blocked_strategy_recommender":
-        plan = "external_augmented"
-        sources = ["external_papers"]
-        external_theme = "recovery-strategies,study-techniques,task-prioritization"
-
-    return {
-        "retrieval_plan": plan,
-        "retrieval_sources": sources,
-        "external_theme_filter": external_theme,
-        "required_citations": required_citations == "yes",
-    }
-
-
 def agent_node(state: AgentState):
     messages = list(state["messages"])
-    user_query = str(state.get("query_text", "") or _latest_user_text(messages))
+    user_query = _latest_user_text(messages)
     system_prompt = _build_agent_system_prompt(state)
 
     if messages and getattr(messages[-1], "type", None) == "tool":
@@ -1379,16 +1284,10 @@ def route_after_verification(state: AgentState):
 
 
 graph = StateGraph(AgentState)
-graph.add_node("query_router", query_router_node)
-graph.add_node("capability_router", capability_router_node)
-graph.add_node("retrieval_planner", retrieval_planner_node)
 graph.add_node("agent", agent_node)
 graph.add_node("tool_executor", tool_executor_node)
 graph.add_node("verification", verification_node)
-graph.set_entry_point("query_router")
-graph.add_edge("query_router", "capability_router")
-graph.add_edge("capability_router", "retrieval_planner")
-graph.add_edge("retrieval_planner", "agent")
+graph.set_entry_point("agent")
 graph.add_conditional_edges(
     "agent",
     route_after_agent,
