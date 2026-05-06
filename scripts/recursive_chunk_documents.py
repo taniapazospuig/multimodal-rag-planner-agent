@@ -20,6 +20,7 @@ from collections import Counter
 from pathlib import Path
 from statistics import mean
 
+import open_clip
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
@@ -49,6 +50,11 @@ TECHNICAL_KEYWORDS = {
     "loss",
 }
 
+OPENCLIP_MODEL = "ViT-B-32"
+OPENCLIP_SOT_TOKEN = 49406
+OPENCLIP_EOT_TOKEN = 49407
+OPENCLIP_TOKENIZER = open_clip.get_tokenizer(OPENCLIP_MODEL)
+
 
 def normalize_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n") # Unify line endings
@@ -58,8 +64,13 @@ def normalize_text(text: str) -> str:
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough token count for chunk sizing; no external tokenizer."""
-    return len(re.findall(r"[A-Za-z0-9_]+|[^\s]", text))
+    """OpenCLIP token count used for chunk sizing."""
+    token_ids = OPENCLIP_TOKENIZER([text])[0].tolist()
+    return sum(
+        1
+        for token_id in token_ids
+        if token_id not in (0, OPENCLIP_SOT_TOKEN, OPENCLIP_EOT_TOKEN)
+    )
 
 
 def merge_small_chunks(chunks: list[str], min_keep_tokens: int) -> list[str]:
@@ -228,9 +239,9 @@ def write_schema(path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Recursive chunking for extracted KB units.")
-    parser.add_argument("--target-tokens", type=int, default=450)
-    parser.add_argument("--overlap-tokens", type=int, default=60)
-    parser.add_argument("--min-keep-tokens", type=int, default=120)
+    parser.add_argument("--target-tokens", type=int, default=70)
+    parser.add_argument("--overlap-tokens", type=int, default=12)
+    parser.add_argument("--min-keep-tokens", type=int, default=30)
     parser.add_argument("--max-docs", type=int, default=0)
     args = parser.parse_args()
 
