@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Iterable
@@ -138,6 +139,15 @@ def main() -> None:
     parser.add_argument("--pretrained", type=str, default="laion2b_s34b_b79k")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument(
+        "--reset-on-dim-mismatch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If the existing Chroma collection has a different embedding dimension, "
+            "delete and recreate that collection automatically."
+        ),
+    )
+    parser.add_argument(
         "--context-mode",
         type=str,
         default="metadata",
@@ -179,6 +189,7 @@ def main() -> None:
 
     # Idempotent indexing using upsert
     indexed = 0
+    did_reset_collection = False
     for batch_rows in batched(rows, args.batch_size):
         documents = [contextual_text(row, context_mode=args.context_mode) for row in batch_rows]
         ids = [str(row.get("chunk_id")) for row in batch_rows]
@@ -186,12 +197,38 @@ def main() -> None:
         with torch.no_grad():
             tokens = tokenizer(documents).to(device)
             emb = model.encode_text(tokens).cpu().numpy().tolist()
-        collection.upsert(
-            ids=ids,
-            documents=documents,
-            metadatas=metadatas,
-            embeddings=emb,
-        )
+        try:
+            collection.upsert(
+                ids=ids,
+                documents=documents,
+                metadatas=metadatas,
+                embeddings=emb,
+            )
+        except chromadb.errors.InvalidArgumentError as exc:
+            msg = str(exc)
+            dim_mismatch = re.search(r"dimension of (\d+), got (\d+)", msg)
+            can_reset = args.reset_on_dim_mismatch and not did_reset_collection
+            if not dim_mismatch or not can_reset:
+                raise
+            expected_dim = dim_mismatch.group(1)
+            got_dim = dim_mismatch.group(2)
+            print(
+                "Detected collection dimension mismatch for "
+                f"'{args.collection}' (existing={expected_dim}, current={got_dim})."
+            )
+            print("Deleting and recreating collection, then retrying current batch...")
+            client.delete_collection(name=args.collection)
+            collection = client.get_or_create_collection(
+                name=args.collection,
+                metadata={"hnsw:space": "cosine"},
+            )
+            did_reset_collection = True
+            collection.upsert(
+                ids=ids,
+                documents=documents,
+                metadatas=metadatas,
+                embeddings=emb,
+            )
         indexed += len(batch_rows)
 
     write_bm25_corpus(

@@ -3,7 +3,7 @@ Personal multimodal planner agent.
 
 Graph is node-first (router -> capability -> retrieval planner -> tool selector ->
 optional tool execution -> decomposition -> evidence formatting -> synthesis ->
-verification), while keeping AgentState message-only for this phase.
+verification), with structured typed AgentState handoffs between nodes.
 """
 
 from __future__ import annotations
@@ -43,6 +43,55 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="google")
 
 class AgentState(TypedDict):
     messages: List[BaseMessage]
+    query_text: str
+    route_intent: str
+    route_confidence: str
+    capability: str
+    capability_reason: str
+    retrieval_plan: str
+    retrieval_sources: list[str]
+    external_theme_filter: str
+    required_citations: bool
+    selected_tools: list[dict[str, Any]]
+    tool_sequence: str
+    skip_reason: str
+    tool_run_status: str
+    raw_tool_evidence: list[str]
+    response_tasks: str
+    must_include: list[str]
+    unresolved_gaps: list[str]
+    evidence_block: str
+    draft_response: str
+    verification_report: dict[str, Any]
+    verify_retry_count: int
+
+
+def _default_agent_state(messages: list[BaseMessage]) -> AgentState:
+    "Create a fully iniitalized AgentState dictionary with default values."
+    return {
+        "messages": messages,
+        "query_text": "",
+        "route_intent": "",
+        "route_confidence": "low",
+        "capability": "course_grounded_qa",
+        "capability_reason": "",
+        "retrieval_plan": "text_only",
+        "retrieval_sources": [],
+        "external_theme_filter": "",
+        "required_citations": True,
+        "selected_tools": [],
+        "tool_sequence": "none",
+        "skip_reason": "",
+        "tool_run_status": "empty",
+        "raw_tool_evidence": [],
+        "response_tasks": "",
+        "must_include": [],
+        "unresolved_gaps": [],
+        "evidence_block": "EVIDENCE_BLOCK_START\n- [none] No tool evidence available.\nEVIDENCE_BLOCK_END",
+        "draft_response": "",
+        "verification_report": {"status": "pass", "notes": ""},
+        "verify_retry_count": 0,
+    }
 
 
 # =========================
@@ -80,176 +129,6 @@ def get_settings() -> Settings:
     if _SETTINGS is None:
         _SETTINGS = load_settings()
     return _SETTINGS
-
-
-@tool
-def search_courses(query: str) -> str:
-    """Search curated course rows (Operations Research, High-Dim Data, Generative AI)."""
-    if not COURSES:
-        return (
-            "No courses.csv found. Add `data/kb/courses.csv` (see example in repo) "
-            "with your real metadata, deadlines, and links."
-        )
-
-    query_tokens = query.lower().split()
-    scored: list[tuple[int, dict]] = []
-    for course in COURSES:
-        text = " ".join(str(v) for v in course.values()).lower()
-        score = sum(token in text for token in query_tokens)
-        if score > 0:
-            scored.append((score, course))
-
-    if not scored:
-        return "No matching course rows."
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    lines = []
-    for _, c in scored[:8]:
-        lines.append(
-            f"{c.get('code', '?')}: {c.get('title', '')} — {c.get('notes', '')}"
-        )
-    return "\n".join(lines)
-
-
-def _peek_indexed_text_context_mode(collection, bm25_rows: list[dict]) -> str | None:
-    """Read context_mode stamped at index time (see scripts/index_text_chunks.py)."""
-    for row in bm25_rows[:32]:
-        meta = row.get("metadata") or {}
-        cm = meta.get("context_mode")
-        if cm in ("none", "metadata"):
-            return str(cm)
-    try:
-        sample = collection.get(limit=1, include=["metadatas"])
-        metas = sample.get("metadatas") or []
-        if metas and metas[0]:
-            cm = (metas[0] or {}).get("context_mode")
-            if cm in ("none", "metadata"):
-                return str(cm)
-    except Exception:
-        pass
-    return None
-
-
-def _format_text_context_mode_banner(settings: Settings, indexed_mode: str | None) -> str:
-    env_mode = settings.text_context_mode
-    if indexed_mode is None:
-        return (
-            f"[text context mode: env={env_mode}; indexed mode unknown — "
-            "re-run scripts/index_text_chunks.py so metadata records context_mode]"
-        )
-    if indexed_mode != env_mode:
-        return (
-            f"[text context mode: index={indexed_mode} env={env_mode} "
-            "(embeddings and stored text follow the index; align .env or re-index)]"
-        )
-    return f"[text context mode={indexed_mode}]"
-
-
-@tool
-def retrieve_context(query: str) -> str:
-    """Retrieve and rerank context for all ablation modes."""
-    settings = get_settings()
-    mode = settings.rag_mode
-    # Stage-1 text retrieval with a large candidate pool
-    text_retriever = get_text_retriever()
-    text_candidates = text_retriever.search(query, k=max(settings.hybrid_k, settings.text_rerank_top_n))
-    if not text_candidates:
-        return (
-            "No text index found yet. Run:\n"
-            "python scripts/index_text_chunks.py\n"
-            "Then retry your question."
-        )
-
-    # Stage-2 text reranking with a local cross-encoder
-    text_reranker = get_text_reranker()
-    text_hits = text_reranker.rerank(query, text_candidates, top_k=settings.hybrid_k)
-    text_reranker_mode = "disabled" if not settings.text_reranker_enabled else "cross-encoder"
-
-    lines = [
-        f"[retrieval mode={mode.value}]",
-        _format_text_context_mode_banner(settings, text_retriever.indexed_text_context_mode),
-        (
-            f"[text reranker={text_reranker_mode} "
-            f"enabled={settings.text_reranker_enabled} model={settings.text_reranker_model}]"
-        ),
-    ]
-    lines.append("Top text context (hybrid retrieval -> text reranker):")
-    for i, hit in enumerate(text_hits, start=1):
-        meta = hit.get("metadata", {})
-        score = float(hit.get("score", 0.0))
-        text = str(hit.get("text", "")).replace("\n", " ").strip()
-        if len(text) > 280:
-            text = text[:280].rstrip() + "..."
-        lines.append(
-            f"{i}. score={score:.4f} | course={meta.get('course','?')} | week={meta.get('week','?')} | "
-            f"doc_id={meta.get('doc_id','?')} | source={meta.get('source_path','?')}\n"
-            f"   {text}"
-        )
-
-    # If multimodal retrieval is enabled, perform visual reranking
-    if mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM:
-        image_candidates = get_image_index().search(query, k=max(3, settings.visual_rerank_top_n))
-        image_hits = image_candidates[:3]
-        if settings.visual_rerank_enabled and image_candidates:
-            image_hits = get_visual_reranker().rerank(query, image_candidates, top_k=3)
-
-        if image_hits:
-            lines.append(
-                f"[visual reranker enabled={settings.visual_rerank_enabled} model={settings.visual_reranker_model}]"
-            )
-            fused = _fuse_multimodal_hits(
-                text_hits=text_hits,
-                image_hits=image_hits,
-                text_alpha=settings.multimodal_fusion_alpha,
-                rrf_k=settings.rrf_k,
-                top_k=settings.multimodal_fusion_k,
-            )
-            lines.append("Fused multimodal context (weighted RRF over reranked text/image candidates):")
-            for i, row in enumerate(fused, start=1):
-                kind = str(row.get("kind", "unknown"))
-                fused_score = float(row.get("score", 0.0))
-                item = row.get("item") or {}
-                if kind == "text":
-                    meta = item.get("metadata", {})
-                    text = str(item.get("text", "")).replace("\n", " ").strip()
-                    if len(text) > 160:
-                        text = text[:160].rstrip() + "..."
-                    lines.append(
-                        f"{i}. [text] fused={fused_score:.4f} | "
-                        f"course={meta.get('course','?')} | doc_id={meta.get('doc_id','?')} | {text}"
-                    )
-                else:
-                    filename = str(item.get("filename", "?"))
-                    rel_path = str(item.get("relative_path", "")).strip()
-                    lines.append(
-                        f"{i}. [image] fused={fused_score:.4f} | "
-                        f"path={rel_path or filename} | doc_id={item.get('doc_id','?')}"
-                    )
-
-            lines.append("Top image context (image retrieval -> visual reranker):")
-            for i, hit in enumerate(image_hits, start=1):
-                dist = float(hit.get("distance", 0.0))
-                score = float(hit.get("visual_rerank_score", _normalize_image_similarity(dist)))
-                source_kind = str(hit.get("source_kind", "unknown"))
-                course = str(hit.get("course", "")).strip()
-                doc_id = str(hit.get("doc_id", "")).strip()
-                page_number = int(hit.get("page_number", 0) or 0)
-                rel_path = str(hit.get("relative_path", "")).strip()
-                filename = str(hit.get("filename", "?")).strip()
-
-                details = [f"source={source_kind}", f"path={rel_path or filename}"]
-                if course:
-                    details.append(f"course={course}")
-                if doc_id:
-                    details.append(f"doc_id={doc_id}")
-                if page_number > 0:
-                    details.append(f"page={page_number}")
-                lines.append(
-                    f"{i}. score={score:.4f} | {filename} (distance {dist:.3f}) | "
-                    + " | ".join(details)
-                )
-
-    return "\n".join(lines)
 
 
 class OpenCLIPBackbone:
@@ -461,11 +340,6 @@ class HybridTextRetriever:
                 )
                 corpus_tokens = [row.get("tokens", []) for row in self.bm25_rows]
                 self.bm25 = BM25Okapi(corpus_tokens)
-
-        self.indexed_text_context_mode = _peek_indexed_text_context_mode(
-            self.collection,
-            self.bm25_rows,
-        )
 
     def _dense_search(self, query: str, where: dict | None) -> list[str]:
         q = self.backbone.encode_text([query])[0]
@@ -1160,7 +1034,6 @@ TOOLS = [
     kb_blocked_intervention_lookup,
 ]
 
-ANNOTATION_PREFIX = "GRAPH_ANNOTATION:"
 INTENT_TO_CAPABILITY = {
     "qa": "course_grounded_qa",
     "weekly_plan": "weekly_study_plan",
@@ -1179,24 +1052,6 @@ THEME_TO_PAPERS = {
 }
 
 
-def _annotation_message(payload: dict[str, Any]) -> SystemMessage:
-    return SystemMessage(content=f"{ANNOTATION_PREFIX}{json.dumps(payload, ensure_ascii=True)}")
-
-
-def _collect_annotations(messages: list[BaseMessage]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for m in messages:
-        if isinstance(m, SystemMessage) and isinstance(m.content, str) and m.content.startswith(ANNOTATION_PREFIX):
-            raw = m.content[len(ANNOTATION_PREFIX) :].strip()
-            try:
-                obj = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict):
-                out.update(obj)
-    return out
-
-
 def _latest_user_text(messages: list[BaseMessage]) -> str:
     for m in reversed(messages):
         if isinstance(m, HumanMessage):
@@ -1209,10 +1064,6 @@ def _latest_ai_message(messages: list[BaseMessage]) -> AIMessage | None:
         if isinstance(m, AIMessage):
             return m
     return None
-
-
-def _collect_tool_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
-    return [m for m in messages if getattr(m, "type", None) == "tool"]
 
 
 def _detect_route_intent(query: str) -> tuple[str, str]:
@@ -1247,25 +1098,39 @@ def _format_tool_sequence(tool_calls: list[dict[str, Any]]) -> str:
     return " -> ".join(str(call.get("name", "")) for call in tool_calls)
 
 
+def _extract_tool_evidence(messages: list[BaseMessage]) -> list[str]:
+    evidence: list[str] = []
+    for m in messages:
+        if getattr(m, "type", None) != "tool":
+            continue
+        text = str(getattr(m, "content", "")).strip().replace("\n", " ")
+        if not text:
+            continue
+        if len(text) > 280:
+            text = text[:280].rstrip() + "..."
+        evidence.append(text)
+    return evidence
+
+
 def query_router_node(state: AgentState):
-    query = _latest_user_text(state["messages"])
+    query = _latest_user_text(state.get("messages", []))
     route_intent, confidence = _detect_route_intent(query)
-    annotation = _annotation_message({"ROUTE_INTENT": route_intent, "ROUTE_CONFIDENCE": confidence})
-    return {"messages": state["messages"] + [annotation]}
+    return {
+        "query_text": query,
+        "route_intent": route_intent,
+        "route_confidence": confidence,
+    }
 
 
 def capability_router_node(state: AgentState):
-    annotations = _collect_annotations(state["messages"])
-    route_intent = str(annotations.get("ROUTE_INTENT", "qa"))
+    route_intent = str(state.get("route_intent", "qa"))
     capability = INTENT_TO_CAPABILITY.get(route_intent, "course_grounded_qa")
     reason = f"mapped from route intent '{route_intent}'"
-    annotation = _annotation_message({"CAPABILITY": capability, "CAPABILITY_REASON": reason})
-    return {"messages": state["messages"] + [annotation]}
+    return {"capability": capability, "capability_reason": reason}
 
 
 def retrieval_planner_node(state: AgentState):
-    annotations = _collect_annotations(state["messages"])
-    capability = str(annotations.get("CAPABILITY", "course_grounded_qa"))
+    capability = str(state.get("capability", "course_grounded_qa"))
     rag_mode = get_settings().rag_mode.value
 
     plan = "text_plus_image" if rag_mode != RAGPipelineMode.TEXT_ONLY.value else "text_only"
@@ -1290,21 +1155,17 @@ def retrieval_planner_node(state: AgentState):
         sources = ["external_papers"]
         external_theme = "recovery-strategies,study-techniques,task-prioritization"
 
-    annotation = _annotation_message(
-        {
-            "RETRIEVAL_PLAN": plan,
-            "RETRIEVAL_SOURCES": ",".join(sources),
-            "EXTERNAL_THEME_FILTER": external_theme,
-            "REQUIRED_CITATIONS": required_citations,
-        }
-    )
-    return {"messages": state["messages"] + [annotation]}
+    return {
+        "retrieval_plan": plan,
+        "retrieval_sources": sources,
+        "external_theme_filter": external_theme,
+        "required_citations": required_citations == "yes",
+    }
 
 
 def tool_selector_node(state: AgentState):
-    annotations = _collect_annotations(state["messages"])
-    capability = str(annotations.get("CAPABILITY", "course_grounded_qa"))
-    query = _latest_user_text(state["messages"])
+    capability = str(state.get("capability", "course_grounded_qa"))
+    query = str(state.get("query_text", "") or _latest_user_text(state.get("messages", [])))
 
     tool_calls: list[dict[str, Any]] = []
 
@@ -1333,7 +1194,7 @@ def tool_selector_node(state: AgentState):
             "kb_external_paper_retrieve",
             {
                 "query": query,
-                "theme_filter": str(annotations.get("EXTERNAL_THEME_FILTER", "")),
+                "theme_filter": str(state.get("external_theme_filter", "")),
                 "paper_ids": "",
                 "top_k": 3,
             },
@@ -1354,22 +1215,31 @@ def tool_selector_node(state: AgentState):
         )
 
     if not tool_calls:
-        annotation = _annotation_message({"TOOL_SEQUENCE": "none", "SKIP_REASON": "No tool required"})
-        return {"messages": state["messages"] + [annotation]}
+        return {
+            "selected_tools": [],
+            "tool_sequence": "none",
+            "skip_reason": "No tool required",
+        }
 
     ai = AIMessage(
         content=f"TOOL_SEQUENCE: {_format_tool_sequence(tool_calls)}",
         tool_calls=tool_calls,
     )
-    return {"messages": state["messages"] + [ai]}
+    return {
+        "messages": state["messages"] + [ai],
+        "selected_tools": tool_calls,
+        "tool_sequence": _format_tool_sequence(tool_calls),
+        "skip_reason": "",
+    }
 
 
 tool_executor_node = ToolNode(TOOLS)
 
 
 def task_decomposer_node(state: AgentState):
-    annotations = _collect_annotations(state["messages"])
-    capability = str(annotations.get("CAPABILITY", "course_grounded_qa"))
+    capability = str(state.get("capability", "course_grounded_qa"))
+    raw_tool_evidence = _extract_tool_evidence(state.get("messages", []))
+    tool_run_status = "success" if raw_tool_evidence else ("empty" if state.get("tool_sequence", "none") != "none" else "skipped")
     templates = {
         "course_grounded_qa": "1) answer directly 2) cite KB evidence",
         "weekly_study_plan": "1) build weekly blocks 2) balance difficulty/cognitive load 3) cite support",
@@ -1378,30 +1248,28 @@ def task_decomposer_node(state: AgentState):
         "research_grounded_planning_coach": "1) recommendation 2) why it works 3) supporting papers",
         "blocked_strategy_recommender": "1) detect block 2) suggest 10-20 min intervention 3) next action + citation",
     }
-    annotation = _annotation_message(
-        {
-            "RESPONSE_TASKS": templates.get(capability, templates["course_grounded_qa"]),
-            "MUST_INCLUDE": "citations",
-            "UNRESOLVED_GAPS": "none",
-        }
-    )
-    return {"messages": state["messages"] + [annotation]}
+    unresolved_gaps = []
+    if state.get("tool_sequence", "none") != "none" and not raw_tool_evidence:
+        unresolved_gaps.append("Tool execution returned no evidence.")
+
+    return {
+        "tool_run_status": tool_run_status,
+        "raw_tool_evidence": raw_tool_evidence,
+        "response_tasks": templates.get(capability, templates["course_grounded_qa"]),
+        "must_include": ["citations"],
+        "unresolved_gaps": unresolved_gaps,
+    }
 
 
 def evidence_formatter_node(state: AgentState):
-    tool_messages = _collect_tool_messages(state["messages"])
     evidence_lines: list[str] = []
-    for idx, m in enumerate(tool_messages[-8:], start=1):
-        content = str(getattr(m, "content", "")).strip().replace("\n", " ")
-        if len(content) > 220:
-            content = content[:220].rstrip() + "..."
+    for idx, content in enumerate(state.get("raw_tool_evidence", [])[:8], start=1):
         evidence_lines.append(f"- [tool_{idx}] {content}")
 
     if not evidence_lines:
         evidence_lines = ["- [none] No tool evidence available."]
 
-    annotation = _annotation_message({"EVIDENCE_BLOCK": "EVIDENCE_BLOCK_START\n" + "\n".join(evidence_lines) + "\nEVIDENCE_BLOCK_END"})
-    return {"messages": state["messages"] + [annotation]}
+    return {"evidence_block": "EVIDENCE_BLOCK_START\n" + "\n".join(evidence_lines) + "\nEVIDENCE_BLOCK_END"}
 
 
 # =========================
@@ -1461,13 +1329,13 @@ def get_plain_llm():
 
 
 def answer_synthesizer_node(state: AgentState):
-    annotations = _collect_annotations(state["messages"])
-    capability = str(annotations.get("CAPABILITY", "course_grounded_qa"))
-    query = _latest_user_text(state["messages"])
-    evidence = str(annotations.get("EVIDENCE_BLOCK", "EVIDENCE_BLOCK_START\n- [none] no evidence\nEVIDENCE_BLOCK_END"))
-    response_tasks = str(annotations.get("RESPONSE_TASKS", "answer + citations"))
-    verify_status = str(annotations.get("VERIFY_STATUS", "pass"))
-    verify_notes = str(annotations.get("VERIFY_NOTES", ""))
+    capability = str(state.get("capability", "course_grounded_qa"))
+    query = str(state.get("query_text", "") or _latest_user_text(state.get("messages", [])))
+    evidence = str(state.get("evidence_block", "EVIDENCE_BLOCK_START\n- [none] no evidence\nEVIDENCE_BLOCK_END"))
+    response_tasks = str(state.get("response_tasks", "answer + citations"))
+    verification_report = state.get("verification_report", {}) or {}
+    verify_status = str(verification_report.get("status", "pass"))
+    verify_notes = str(verification_report.get("notes", ""))
 
     revise_instruction = ""
     if verify_status == "revise" and verify_notes:
@@ -1483,20 +1351,26 @@ def answer_synthesizer_node(state: AgentState):
         f"Capability: {capability}\n"
         f"User query: {query}\n"
         f"Required response tasks: {response_tasks}\n"
+        f"Must include: {', '.join(state.get('must_include', [])) or 'none'}\n"
+        f"Unresolved gaps: {', '.join(state.get('unresolved_gaps', [])) or 'none'}\n"
         f"{evidence}\n"
         f"{revise_instruction}"
         "Return only the final user-facing response."
     )
     response = get_plain_llm().invoke([SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)])
-    return {"messages": state["messages"] + [response]}
+    return {
+        "messages": state["messages"] + [response],
+        "draft_response": _render_assistant_content(response.content),
+    }
 
 
 def verification_node(state: AgentState):
-    annotations = _collect_annotations(state["messages"])
-    required_citations = str(annotations.get("REQUIRED_CITATIONS", "yes")).lower() == "yes"
-    draft_msg = _latest_ai_message(state["messages"])
-    draft = _render_assistant_content(draft_msg.content if draft_msg else "")
-    retry_count = int(annotations.get("VERIFY_RETRY_COUNT", 0) or 0)
+    required_citations = bool(state.get("required_citations", True))
+    draft = str(state.get("draft_response", "")).strip()
+    if not draft:
+        draft_msg = _latest_ai_message(state.get("messages", []))
+        draft = _render_assistant_content(draft_msg.content if draft_msg else "").strip()
+    retry_count = int(state.get("verify_retry_count", 0) or 0)
 
     has_citation = bool(
         re.search(
@@ -1518,15 +1392,7 @@ def verification_node(state: AgentState):
         status = "pass"
         notes = "Format and citations look acceptable."
 
-    out_messages = state["messages"] + [
-        _annotation_message(
-            {
-                "VERIFY_STATUS": status,
-                "VERIFY_NOTES": notes,
-                "VERIFY_RETRY_COUNT": retry_count + (1 if status == "revise" else 0),
-            }
-        )
-    ]
+    out_messages = list(state["messages"])
 
     if status == "abstain":
         safe = AIMessage(
@@ -1537,19 +1403,23 @@ def verification_node(state: AgentState):
         )
         out_messages.append(safe)
 
-    return {"messages": out_messages}
+    next_retry_count = retry_count + (1 if status == "revise" else 0)
+    return {
+        "messages": out_messages,
+        "verification_report": {"status": status, "notes": notes},
+        "verify_retry_count": next_retry_count,
+    }
 
 
 def route_after_tool_selector(state: AgentState):
-    last = state["messages"][-1]
-    if isinstance(last, AIMessage) and last.tool_calls:
+    if str(state.get("tool_sequence", "none")) != "none":
         return "tool_executor"
     return "task_decomposer"
 
 
 def route_after_verification(state: AgentState):
-    annotations = _collect_annotations(state["messages"])
-    status = str(annotations.get("VERIFY_STATUS", "pass"))
+    report = state.get("verification_report", {}) or {}
+    status = str(report.get("status", "pass"))
     if status == "revise":
         return "revise"
     if status == "abstain":
@@ -1617,11 +1487,11 @@ if __name__ == "__main__":
             break
 
         result = app.invoke(
-            {
-                "messages": [
+            _default_agent_state(
+                [
                     HumanMessage(content=user),
                 ]
-            }
+            )
         )
         last_ai = _latest_ai_message(result["messages"])
         if last_ai is None:
