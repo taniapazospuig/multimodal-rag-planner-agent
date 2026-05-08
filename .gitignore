@@ -18,3 +18,7 @@ data/kb/
 
 # OS
 .DS_Store
+
+# temp files
+copy_original_planner_agent.py
+

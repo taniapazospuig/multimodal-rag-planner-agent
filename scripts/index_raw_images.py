@@ -17,6 +17,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import csv
 from pathlib import Path
 from typing import Iterable
 
@@ -29,6 +30,7 @@ from PIL import Image
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RAW_ROOT = PROJECT_ROOT / "data/kb/00_raw"
 DEFAULT_CHROMA_PATH = PROJECT_ROOT / "chroma_db"
+DEFAULT_DOCUMENTS_CSV = PROJECT_ROOT / "data/kb/metadata/documents.csv"
 DEFAULT_FOLDERS = ("planner-screenshots", "study-location-photos", "todo-lists")
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
@@ -44,7 +46,27 @@ def to_image_id(path: Path) -> str:
     return f"img__{rel}"
 
 
-def sanitize_metadata(path: Path, raw_root: Path) -> dict:
+def load_documents_metadata(documents_csv: Path) -> dict[str, dict[str, str]]:
+    """Load source_path -> metadata mapping from documents.csv."""
+    if not documents_csv.exists():
+        raise SystemExit(f"documents.csv not found: {documents_csv}")
+    out: dict[str, dict[str, str]] = {}
+    with documents_csv.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            source_path = str(row.get("source_path", "")).strip().replace("\\", "/")
+            if not source_path:
+                continue
+            out[source_path] = {
+                "doc_id": str(row.get("doc_id", "")).strip(),
+                "course": str(row.get("course", "")).strip(),
+                "week": str(row.get("week", "")).strip(),
+                "resource_type": str(row.get("resource_type", "")).strip(),
+            }
+    return out
+
+
+def sanitize_metadata(path: Path, raw_root: Path, doc_meta: dict[str, str]) -> dict:
     rel_project = path.relative_to(PROJECT_ROOT).as_posix()
     rel_raw = path.relative_to(raw_root).as_posix()
     raw_folder = rel_raw.split("/", maxsplit=1)[0] if "/" in rel_raw else rel_raw
@@ -54,6 +76,10 @@ def sanitize_metadata(path: Path, raw_root: Path) -> dict:
         "path": str(path),
         "relative_path": rel_project,
         "raw_folder": raw_folder,
+        "resource_type": str(doc_meta.get("resource_type", "")).strip(),
+        "doc_id": str(doc_meta.get("doc_id", "")).strip(),
+        "course": str(doc_meta.get("course", "")).strip(),
+        "week": str(doc_meta.get("week", "")).strip(),
     }
 
 
@@ -77,6 +103,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Index selected raw image folders into Chroma.")
     parser.add_argument("--raw-root", type=Path, default=DEFAULT_RAW_ROOT)
     parser.add_argument("--folders", type=str, default=",".join(DEFAULT_FOLDERS))
+    parser.add_argument("--documents-csv", type=Path, default=DEFAULT_DOCUMENTS_CSV)
     parser.add_argument("--chroma-path", type=Path, default=DEFAULT_CHROMA_PATH)
     parser.add_argument("--collection", type=str, default="planner_images")
     parser.add_argument("--model", type=str, default="ViT-B-32")
@@ -94,6 +121,7 @@ def main() -> None:
         raise SystemExit("No folders provided. Use --folders with comma-separated folder names.")
     if not args.raw_root.exists():
         raise SystemExit(f"Raw root does not exist: {args.raw_root}")
+    doc_meta_by_source = load_documents_metadata(args.documents_csv)
 
     client = chromadb.PersistentClient(path=str(args.chroma_path))
     if args.force:
@@ -109,15 +137,22 @@ def main() -> None:
 
     image_paths = collect_images(args.raw_root, folders)
     candidates: list[dict] = []
+    skipped_missing_metadata = 0
     for path in image_paths:
         image_id = to_image_id(path)
         if not args.force and image_id in existing_ids:
+            continue
+        source_key = path.relative_to(PROJECT_ROOT).as_posix()
+        doc_meta = doc_meta_by_source.get(source_key)
+        # Strict mode: index only files present in documents.csv mapping.
+        if not doc_meta or not str(doc_meta.get("resource_type", "")).strip():
+            skipped_missing_metadata += 1
             continue
         candidates.append(
             {
                 "id": image_id,
                 "path": path,
-                "metadata": sanitize_metadata(path, args.raw_root),
+                "metadata": sanitize_metadata(path, args.raw_root, doc_meta),
             }
         )
 
@@ -162,6 +197,7 @@ def main() -> None:
 
     print(f"Folders: {', '.join(folders)}")
     print(f"Discovered images: {len(image_paths)}")
+    print(f"Skipped (missing documents.csv metadata): {skipped_missing_metadata}")
     print(f"Indexed images: {indexed}")
     print(f"Collection: {args.collection}")
     print(f"Chroma path: {args.chroma_path}")

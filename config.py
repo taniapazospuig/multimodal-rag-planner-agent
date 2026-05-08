@@ -8,9 +8,9 @@ from enum import Enum
 
 
 # Defaults if environment variables missing:
-# - LLM: gemini-3.1-flash-lite-preview
+# - LLM: gemini-3.1-flash-lite
 # - Embeddings: OpenCLIP ViT-B-32 + laion2b_s34b_b79k
-DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_OPENCLIP_MODEL = "ViT-B-32"
 DEFAULT_OPENCLIP_PRETRAINED = "laion2b_s34b_b79k"
 
