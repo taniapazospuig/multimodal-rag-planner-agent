@@ -1,6 +1,8 @@
 """
-Minimal planner agent with a single capability:
-C1 TopicSummary (topics studied in course/week from retrieved evidence).
+Minimal planner agent with three capabilities:
+- C1 TopicSummary (topics studied in course/week from retrieved evidence)
+- C2 DurationEstimator (estimate study time for a course-related task)
+- C3 FreeSlotFinder (find open slots in a target week/day)
 
 This module intentionally reuses already-built retrieval artifacts:
 - Chroma DB in `chroma_db` (dense index)
@@ -18,6 +20,7 @@ import logging
 import re
 import warnings
 from collections import defaultdict
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, List, TypedDict
 
@@ -62,13 +65,81 @@ def load_courses(path: Path) -> list[dict[str, str]]:
     return [dict(row) for row in rows]
 
 
+def _load_csv_rows(path: Path) -> list[dict[str, str]]:
+    """Load a metadata CSV into memory as row dictionaries."""
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+    return [dict(row) for row in rows]
+
+
+def get_task_rows() -> list[dict[str, str]]:
+    """Return cached planner task rows."""
+    global _TASK_ROWS
+    if _TASK_ROWS is None:
+        _TASK_ROWS = _load_csv_rows(TASKS_CSV_PATH)
+    return _TASK_ROWS
+
+
+def get_document_rows() -> list[dict[str, str]]:
+    """Return cached KB document metadata rows."""
+    global _DOCUMENT_ROWS
+    if _DOCUMENT_ROWS is None:
+        _DOCUMENT_ROWS = _load_csv_rows(DOCUMENTS_CSV_PATH)
+    return _DOCUMENT_ROWS
+
+
+def get_dependency_rows() -> list[dict[str, str]]:
+    """Return cached task-to-assignment dependency rows."""
+    global _DEPENDENCY_ROWS
+    if _DEPENDENCY_ROWS is None:
+        _DEPENDENCY_ROWS = _load_csv_rows(DEPENDENCIES_CSV_PATH)
+    return _DEPENDENCY_ROWS
+
+
+def get_assignment_rows() -> list[dict[str, str]]:
+    """Return cached assignment metadata rows."""
+    global _ASSIGNMENT_ROWS
+    if _ASSIGNMENT_ROWS is None:
+        _ASSIGNMENT_ROWS = _load_csv_rows(ASSIGNMENTS_CSV_PATH)
+    return _ASSIGNMENT_ROWS
+
+
 COURSES_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "courses.csv"
 COURSES = load_courses(COURSES_CSV_PATH)
 
 _SETTINGS: Settings | None = None
 _LLM = None
+_ESTIMATOR_LLM = None
 _RETRIEVER: "CourseRetriever | None" = None
 _OPENCLIP_BACKBONE: "OpenCLIPBackbone | None" = None
+_TASK_ROWS: list[dict[str, str]] | None = None
+_DOCUMENT_ROWS: list[dict[str, str]] | None = None
+_DEPENDENCY_ROWS: list[dict[str, str]] | None = None
+_ASSIGNMENT_ROWS: list[dict[str, str]] | None = None
+
+TASKS_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "tasks.csv"
+DOCUMENTS_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "documents.csv"
+DEPENDENCIES_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "dependencies.csv"
+ASSIGNMENTS_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "assignments.csv"
+
+DAY_TO_ABBR = {
+    "monday": "Mon",
+    "mon": "Mon",
+    "tuesday": "Tue",
+    "tue": "Tue",
+    "wednesday": "Wed",
+    "wed": "Wed",
+    "thursday": "Thu",
+    "thu": "Thu",
+    "friday": "Fri",
+    "fri": "Fri",
+    "saturday": "Sat",
+    "sat": "Sat",
+    "sunday": "Sun",
+    "sun": "Sun",
+}
 
 
 def get_settings() -> Settings:
@@ -168,6 +239,178 @@ def _detect_week_filter(query: str) -> str:
     if week_num <= 0:
         return ""
     return f"week-{week_num:02d}"
+
+
+def _detect_day_filter(query: str) -> str:
+    """Infer canonical day abbreviation from free-form query text."""
+    normalized_query = _normalize_for_match(query)
+    for label, abbr in DAY_TO_ABBR.items():
+        if _term_in_query(label, normalized_query):
+            return abbr
+    return ""
+
+
+def _normalize_day_filter(value: str) -> str:
+    """Normalize user day filter to Mon/Tue/... format."""
+    normalized = _normalize_for_match(value)
+    return DAY_TO_ABBR.get(normalized, "")
+
+
+def _resolve_week_filter(raw_week_filter: str, query: str = "") -> str:
+    """Resolve week filter from explicit input or query text."""
+    candidate = raw_week_filter.strip().lower()
+    if candidate:
+        return candidate
+    return _detect_week_filter(query)
+
+
+def _week_to_screenshot_stem(week_filter: str) -> str:
+    """Map canonical week tags to screenshot stems used by tasks.csv."""
+    normalized = week_filter.strip().lower()
+    if not normalized:
+        return ""
+    if normalized == "easter-week":
+        return "easter-week"
+    match = re.match(r"^week-(\d{1,2})$", normalized)
+    if not match:
+        return normalized
+    return f"week{int(match.group(1))}"
+
+
+def _parse_hhmm_to_minutes(value: str) -> int | None:
+    """Parse HH:MM into minutes since midnight."""
+    raw = value.strip()
+    try:
+        parsed = datetime.strptime(raw, "%H:%M")
+    except ValueError:
+        return None
+    return parsed.hour * 60 + parsed.minute
+
+
+def _minutes_to_hhmm(total_minutes: int) -> str:
+    """Render minutes since midnight as HH:MM."""
+    clamped = max(0, min(24 * 60, int(total_minutes)))
+    hours = clamped // 60
+    minutes = clamped % 60
+    if hours == 24 and minutes == 0:
+        return "24:00"
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def _safe_int(value: Any, default: int) -> int:
+    """Best-effort integer parsing with fallback."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_int(value: int, low: int, high: int) -> int:
+    """Clamp an integer to a closed range."""
+    return max(low, min(high, int(value)))
+
+
+def _extract_first_json_object(raw_text: str) -> dict[str, Any] | None:
+    """Extract the first JSON object from raw model output."""
+    text = raw_text.strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        return None
+    return None
+
+
+def _extract_marker_value(raw_text: str, marker: str) -> str:
+    """Extract a line marker value from tool output."""
+    for line in raw_text.splitlines():
+        if line.startswith(marker):
+            return line[len(marker) :].strip()
+    return ""
+
+
+def _filter_tasks_for_week(task_rows: list[dict[str, str]], week_filter: str) -> list[dict[str, str]]:
+    """Filter tasks.csv rows by dataset week tag."""
+    stem = _week_to_screenshot_stem(week_filter)
+    if not stem:
+        return []
+    output: list[dict[str, str]] = []
+    for row in task_rows:
+        screenshot = str(row.get("screenshot", "")).strip().lower()
+        screenshot_stem = Path(screenshot).stem
+        if screenshot_stem == stem:
+            output.append(row)
+    return output
+
+
+def _build_assignment_pressure_lines(course_filter: str, week_filter: str) -> list[str]:
+    """Summarize assignment pressure linked to tasks in the selected week/course."""
+    if not course_filter or not week_filter:
+        return []
+    week_tasks = [
+        row
+        for row in _filter_tasks_for_week(get_task_rows(), week_filter)
+        if str(row.get("course", "")).strip().lower() == course_filter
+    ]
+    if not week_tasks:
+        return []
+    task_ids = {str(row.get("task_id", "")).strip() for row in week_tasks}
+    assignment_by_id = {
+        str(row.get("assignment_id", "")).strip(): row
+        for row in get_assignment_rows()
+        if str(row.get("assignment_id", "")).strip()
+    }
+    week_dates: list[date] = []
+    for row in week_tasks:
+        try:
+            week_dates.append(datetime.strptime(str(row.get("date", "")), "%Y-%m-%d").date())
+        except ValueError:
+            continue
+    week_start = min(week_dates) if week_dates else None
+
+    linked_assignment_ids = {
+        str(dep.get("depends_on_assignment_id", "")).strip()
+        for dep in get_dependency_rows()
+        if str(dep.get("task_id", "")).strip() in task_ids
+    }
+    lines: list[str] = []
+    for assignment_id in sorted(linked_assignment_ids):
+        if not assignment_id:
+            continue
+        row = assignment_by_id.get(assignment_id)
+        if not row:
+            continue
+        due_raw = str(row.get("due_date", "")).strip()
+        due_date = None
+        if due_raw:
+            due_part = due_raw.split("T", maxsplit=1)[0].strip()
+            try:
+                due_date = datetime.strptime(due_part, "%Y-%m-%d").date()
+            except ValueError:
+                due_date = None
+        days_to_due = ""
+        if week_start and due_date:
+            days_to_due = f", days_to_due_from_week_start={int((due_date - week_start).days)}"
+        lines.append(
+            (
+                f"- assignment_id={assignment_id}, name={row.get('name', 'unknown')}, "
+                f"weight_pct={row.get('weight_pct', '')}, due_date={due_raw or 'na'}{days_to_due}, "
+                f"is_hurdle={row.get('is_hurdle', '')}"
+            )
+        )
+    return lines[:6]
 
 
 def _rrf_fuse(dense_ranked_ids: list[str], bm25_ranked_ids: list[str], k: int) -> dict[str, float]:
@@ -431,7 +674,7 @@ def get_retriever() -> CourseRetriever:
 
 @tool
 def kb_course_retrieval(
-    query: str,
+    query: str = "",
     top_k: int = 6,
     course_filter: str = "",
     week_filter: str = "",
@@ -452,8 +695,17 @@ def kb_course_retrieval(
         resolved_course = _detect_course_filter(query)
     resolved_week = week_filter.strip().lower() or _detect_week_filter(query)
 
+    normalized_query = query.strip()
+    if not normalized_query:
+        fallback_parts = ["course materials"]
+        if resolved_course:
+            fallback_parts.append(resolved_course.replace("-", " "))
+        if resolved_week:
+            fallback_parts.append(resolved_week.replace("-", " "))
+        normalized_query = " ".join(fallback_parts)
+
     hits = get_retriever().search(
-        query=query.strip(),
+        query=normalized_query,
         top_k=max(1, int(top_k)),
         course_filter=resolved_course,
         week_filter=resolved_week,
@@ -504,29 +756,317 @@ def kb_course_retrieval(
     return "\n".join(lines)
 
 
-TOOLS = [kb_course_retrieval]
+@tool
+def estimate_study_duration(
+    task_query: str = "",
+    query: str = "",
+    course_filter: str = "",
+    week_filter: str = "",
+    day_filter: str = "",
+    target_outcome: str = "",
+) -> str:
+    """
+    C2 duration estimator: infer study minutes from grounded metadata and retrieved evidence.
+
+    Args:
+        task_query: User task to estimate.
+        course_filter: Optional explicit course slug.
+        week_filter: Optional week tag (for example, week-03).
+        day_filter: Optional day constraint (for example, Tue).
+        target_outcome: Optional task intent hint (review, quiz, assignment, project).
+    """
+    normalized_task_query = task_query.strip() or query.strip()
+    if not normalized_task_query:
+        return "C2_DURATION_ESTIMATE:\nquery field was missing."
+
+    settings = get_settings()
+    resolved_course = course_filter.strip().lower()
+    if not resolved_course and settings.course_filter_enabled:
+        resolved_course = _detect_course_filter(normalized_task_query)
+    resolved_week = _resolve_week_filter(week_filter, query=normalized_task_query)
+    resolved_day = _normalize_day_filter(day_filter) or _detect_day_filter(normalized_task_query)
+    outcome = target_outcome.strip().lower() or "unspecified"
+
+    candidate_docs = [
+        row
+        for row in get_document_rows()
+        if (not resolved_course or str(row.get("course", "")).strip().lower() == resolved_course)
+        and (not resolved_week or str(row.get("week", "")).strip().lower() == resolved_week)
+    ][:20]
+    doc_lines: list[str] = []
+    for row in candidate_docs[:8]:
+        doc_lines.append(
+            (
+                f"- doc_id={row.get('doc_id', '')}, title={row.get('title', '')}, "
+                f"resource_type={row.get('resource_type', '')}, modality={row.get('modality', '')}, "
+                f"difficulty={row.get('difficulty', '')}, cognitive_load={row.get('cognitive_load', '')}, "
+                f"course={row.get('course', '')}, week={row.get('week', '')}"
+            )
+        )
+
+    hits = get_retriever().search(
+        query=normalized_task_query,
+        top_k=max(3, min(8, int(settings.hybrid_k))),
+        course_filter=resolved_course,
+        week_filter=resolved_week,
+    )
+    retrieval_lines: list[str] = []
+    for hit in hits[:5]:
+        metadata = hit.get("metadata", {}) or {}
+        snippet = str(hit.get("text", "")).replace("\n", " ").strip()
+        if len(snippet) > 220:
+            snippet = snippet[:220].rstrip() + "..."
+        retrieval_lines.append(
+            (
+                f"- source={Path(str(metadata.get('source_path', 'unknown'))).name}, "
+                f"resource_type={metadata.get('resource_type', '')}, difficulty_hint={metadata.get('difficulty', '')}, "
+                f"cognitive_hint={metadata.get('cognitive_load', '')}, snippet={snippet}"
+            )
+        )
+    pressure_lines = _build_assignment_pressure_lines(
+        course_filter=resolved_course,
+        week_filter=resolved_week,
+    )
+
+    prompt_messages = [
+        SystemMessage(
+            content=(
+                "You estimate study duration for a personal planner.\n"
+                "Use only the grounded evidence provided by the user.\n"
+                "Return strict JSON only with keys:\n"
+                "- estimated_minutes (integer)\n"
+                "- confidence (one of: low, medium, high)\n"
+                "- rationale (short string, mention key evidence signals)\n"
+                "- suggested_blocking (string, e.g., '2 x 60min').\n"
+                "Do not call any tools."
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"task_query={normalized_task_query}\n"
+                f"target_outcome={outcome}\n"
+                f"resolved_course={resolved_course or 'none'}\n"
+                f"resolved_week={resolved_week or 'none'}\n"
+                f"resolved_day={resolved_day or 'none'}\n\n"
+                "documents.csv candidates:\n"
+                f"{chr(10).join(doc_lines) if doc_lines else '- none'}\n\n"
+                "retrieved evidence snippets:\n"
+                f"{chr(10).join(retrieval_lines) if retrieval_lines else '- none'}\n\n"
+                "assignment pressure summary:\n"
+                f"{chr(10).join(pressure_lines) if pressure_lines else '- none'}\n"
+            )
+        ),
+    ]
+    raw_response = _render_assistant_content(get_reasoning_llm().invoke(prompt_messages).content)
+    payload = _extract_first_json_object(raw_response)
+    if not payload or "estimated_minutes" not in payload:
+        return (
+            "C2_DURATION_ESTIMATE:\n"
+            "Estimator did not return valid JSON output. "
+            "Ask the agent to retry the duration estimation."
+        )
+
+    estimated_minutes = _clamp_int(_safe_int(payload.get("estimated_minutes"), 0), 30, 240)
+    confidence = str(payload.get("confidence", "medium")).strip().lower()
+    if confidence not in {"low", "medium", "high"}:
+        confidence = "medium"
+    rationale = str(payload.get("rationale", "")).strip() or "No rationale provided by estimator."
+    suggested_blocking = str(payload.get("suggested_blocking", "")).strip() or f"1 x {estimated_minutes}min"
+
+    result_payload = {
+        "estimated_minutes": estimated_minutes,
+        "confidence": confidence,
+        "rationale": rationale,
+        "suggested_blocking": suggested_blocking,
+    }
+    lines = [
+        "C2_DURATION_ESTIMATE:",
+        (
+            f"Applied filters -> course={resolved_course or 'none'} | "
+            f"week={resolved_week or 'none'} | day={resolved_day or 'none'} | outcome={outcome}"
+        ),
+        f"REQUIRED_MINUTES={estimated_minutes}",
+        f"RESOLVED_WEEK_FILTER={resolved_week or ''}",
+        f"RESOLVED_DAY_FILTER={resolved_day or ''}",
+        f"ESTIMATE_JSON={json.dumps(result_payload, ensure_ascii=True)}",
+    ]
+    return "\n".join(lines)
+
+
+@tool
+def find_free_slots(
+    week_filter: str,
+    required_minutes: int,
+    day_filter: str = "",
+    min_slot_minutes: int = 30,
+    day_start: str = "07:00",
+    day_end: str = "22:00",
+) -> str:
+    """
+    C3 free slot finder: compute free planner intervals in a target week/day.
+
+    Args:
+        week_filter: Dataset week tag (week-01..week-07 or easter-week).
+        required_minutes: Estimated study minutes to fit.
+        day_filter: Optional day (Mon/Tue/...).
+        min_slot_minutes: Minimum candidate slot duration.
+        day_start: Day bound start (HH:MM).
+        day_end: Day bound end (HH:MM).
+    """
+    resolved_week = _resolve_week_filter(week_filter)
+    if not resolved_week:
+        return "C3_FREE_SLOTS:\nweek_filter field was missing."
+
+    resolved_day = _normalize_day_filter(day_filter)
+    required = _clamp_int(_safe_int(required_minutes, 60), 15, 360)
+    min_slot = _clamp_int(_safe_int(min_slot_minutes, 30), 15, 240)
+    start_min = _parse_hhmm_to_minutes(day_start)
+    end_min = _parse_hhmm_to_minutes(day_end)
+    if start_min is None or end_min is None or start_min >= end_min:
+        return "C3_FREE_SLOTS:\nInvalid day_start/day_end bounds."
+
+    week_rows = _filter_tasks_for_week(get_task_rows(), resolved_week)
+    if resolved_day:
+        week_rows = [row for row in week_rows if str(row.get("day", "")).strip() == resolved_day]
+    if not week_rows:
+        return (
+            "C3_FREE_SLOTS:\n"
+            f"Applied filters -> week={resolved_week} | day={resolved_day or 'all'}\n"
+            "No planner rows matched the selected week/day."
+        )
+
+    by_date: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
+    parsed_dates: list[date] = []
+    for row in week_rows:
+        date_value = str(row.get("date", "")).strip()
+        if not date_value:
+            continue
+        try:
+            parsed_dates.append(datetime.strptime(date_value, "%Y-%m-%d").date())
+        except ValueError:
+            continue
+    if parsed_dates:
+        cursor_date = min(parsed_dates)
+        max_date = max(parsed_dates)
+        while cursor_date <= max_date:
+            day_abbr = cursor_date.strftime("%a")
+            if not resolved_day or day_abbr == resolved_day:
+                by_date[(cursor_date.isoformat(), day_abbr)] = []
+            cursor_date = date.fromordinal(cursor_date.toordinal() + 1)
+
+    for row in week_rows:
+        date_value = str(row.get("date", "")).strip()
+        day_value = str(row.get("day", "")).strip()
+        task_start = _parse_hhmm_to_minutes(str(row.get("start_time", "")))
+        task_end = _parse_hhmm_to_minutes(str(row.get("end_time", "")))
+        if task_start is None or task_end is None or task_end <= task_start:
+            continue
+        clipped_start = max(start_min, task_start)
+        clipped_end = min(end_min, task_end)
+        if clipped_end <= clipped_start:
+            continue
+        by_date[(date_value, day_value)].append((clipped_start, clipped_end))
+
+    slots: list[dict[str, Any]] = []
+    for (date_value, day_value), intervals in sorted(by_date.items()):
+        merged: list[tuple[int, int]] = []
+        for interval_start, interval_end in sorted(intervals):
+            if not merged or interval_start > merged[-1][1]:
+                merged.append((interval_start, interval_end))
+            else:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], interval_end))
+
+        cursor = start_min
+        for interval_start, interval_end in merged:
+            gap = interval_start - cursor
+            if gap >= min_slot:
+                slots.append(
+                    {
+                        "date": date_value,
+                        "day": day_value,
+                        "start": cursor,
+                        "end": interval_start,
+                        "duration": gap,
+                        "fits_required": gap >= required,
+                    }
+                )
+            cursor = max(cursor, interval_end)
+        tail_gap = end_min - cursor
+        if tail_gap >= min_slot:
+            slots.append(
+                {
+                    "date": date_value,
+                    "day": day_value,
+                    "start": cursor,
+                    "end": end_min,
+                    "duration": tail_gap,
+                    "fits_required": tail_gap >= required,
+                }
+            )
+
+    if not slots:
+        return (
+            "C3_FREE_SLOTS:\n"
+            f"Applied filters -> week={resolved_week} | day={resolved_day or 'all'}\n"
+            "No free slots found within the selected day bounds."
+        )
+
+    fitting = [slot for slot in slots if bool(slot.get("fits_required"))]
+    fitting.sort(key=lambda slot: (str(slot.get("date")), int(slot.get("start", 0)), -int(slot.get("duration", 0))))
+    partial = sorted(slots, key=lambda slot: int(slot.get("duration", 0)), reverse=True)
+
+    lines = [
+        "C3_FREE_SLOTS:",
+        (
+            f"Applied filters -> week={resolved_week} | day={resolved_day or 'all'} | "
+            f"required_minutes={required} | day_bounds={day_start}-{day_end}"
+        ),
+    ]
+    if fitting:
+        lines.append("Best fitting slots:")
+        for index, slot in enumerate(fitting[:6], start=1):
+            lines.append(
+                (
+                    f"{index}. {slot['date']} {slot['day']} { _minutes_to_hhmm(int(slot['start'])) }-"
+                    f"{ _minutes_to_hhmm(int(slot['end'])) } ({slot['duration']} min)"
+                )
+            )
+    else:
+        lines.append("No exact-fit slot found. Largest partial slots:")
+        for index, slot in enumerate(partial[:6], start=1):
+            lines.append(
+                (
+                    f"{index}. {slot['date']} {slot['day']} { _minutes_to_hhmm(int(slot['start'])) }-"
+                    f"{ _minutes_to_hhmm(int(slot['end'])) } ({slot['duration']} min)"
+                )
+            )
+    lines.append(f"SLOTS_JSON={json.dumps(slots[:20], ensure_ascii=True)}")
+    return "\n".join(lines)
+
+
+TOOLS = [kb_course_retrieval, estimate_study_duration, find_free_slots]
 
 
 SYSTEM_PROMPT = SystemMessage(
     content=(
-        "You are a C1 TopicSummary assistant.\n"
-        "C1 definition: Summarize key topics studied in a given course/week from retrieved evidence.\n"
-        "Use kb_course_retrieval to gather evidence first."
+        "You are a study planner assistant with three capabilities.\n"
+        "C1 TopicSummary: summarize topics studied in a course/week using kb_course_retrieval.\n"
+        "C2 DurationEstimator: estimate how many minutes a course-related task should take.\n"
+        "C3 FreeSlotFinder: find open schedule slots in a target week/day given required_minutes.\n"
+        "Respect dataset week tags like week-01..week-07 and easter-week.\n"
+        "Routing rules:\n"
+        "- If user asks to estimate time/effort/duration, call estimate_study_duration first.\n"
+        "- If user asks to summarize topics/content, call kb_course_retrieval first.\n"
+        "- If user asks for scheduling availability, call find_free_slots first.\n"
+        "Always include required tool arguments."
     )
 )
 
 
 def _build_llm(settings: Settings):
-    """Create LLM backend and bind available tools."""
-    if settings.llm_backend == LLMBackend.OLLAMA:
-        from langchain_ollama import ChatOllama
-
-        return ChatOllama(
-            model=settings.ollama_model,
-            base_url=settings.ollama_base_url,
-            temperature=0,
-        ).bind_tools(TOOLS)
-
+    """Create Gemini backend and bind available tools."""
+    if settings.llm_backend != LLMBackend.GEMINI:
+        raise ValueError("This agent is configured for Gemini-only runtime.")
     from langchain_google_genai import ChatGoogleGenerativeAI
 
     if not settings.gemini_api_key:
@@ -541,12 +1081,38 @@ def _build_llm(settings: Settings):
     ).bind_tools(TOOLS)
 
 
+def _build_reasoning_llm(settings: Settings):
+    """Create a plain Gemini client without bound tools."""
+    if settings.llm_backend != LLMBackend.GEMINI:
+        raise ValueError("This agent is configured for Gemini-only runtime.")
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    if not settings.gemini_api_key:
+        raise ValueError(
+            "Gemini selected but API key is missing. Set GOOGLE_API_KEY or GEMINI_API_KEY."
+        )
+    return ChatGoogleGenerativeAI(
+        model=settings.gemini_model,
+        temperature=0,
+        api_key=settings.gemini_api_key,
+        convert_system_message_to_human=True,
+    )
+
+
 def get_llm():
     """Return singleton LLM instance."""
     global _LLM
     if _LLM is None:
         _LLM = _build_llm(get_settings())
     return _LLM
+
+
+def get_reasoning_llm():
+    """Return singleton plain LLM used for non-tool reasoning steps."""
+    global _ESTIMATOR_LLM
+    if _ESTIMATOR_LLM is None:
+        _ESTIMATOR_LLM = _build_reasoning_llm(get_settings())
+    return _ESTIMATOR_LLM
 
 
 def _latest_user_text(messages: list[BaseMessage]) -> str:
@@ -594,12 +1160,13 @@ def _image_path_to_data_url(path: str, max_edge: int) -> str:
 
 
 def agent_node(state: AgentState):
-    """LLM node: chooses tool first, then produces user-facing topic summary."""
+    """LLM node: routes tool calls and composes final C1/C2/C3 responses."""
     messages = state["messages"]
     user_query = _latest_user_text(messages)
 
     if messages and getattr(messages[-1], "type", None) == "tool":
         settings = get_settings()
+        tool_name = str(getattr(messages[-1], "name", "")).strip()
         tool_result = str(messages[-1].content)
         if "query field was missing" in tool_result.lower() and user_query.strip():
             logging.getLogger(__name__).warning(
@@ -616,63 +1183,99 @@ def agent_node(state: AgentState):
                 )
             except Exception as exc:
                 logging.getLogger(__name__).warning("tool_retry failed: %s", exc)
-        image_paths = _extract_image_paths(tool_result)
-        include_images = settings.rag_mode in {
-            RAGPipelineMode.TEXT_RETRIEVAL_MLLM,
-            RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM,
-        }
+
         non_tool_messages = [m for m in messages if getattr(m, "type", None) != "tool"]
-        user_payload: str | list[dict[str, Any]]
-        if include_images and image_paths:
-            multimodal_content: list[dict[str, Any]] = [
-                {
-                    "type": "text",
-                    "text": (
-                        f'User request: "{user_query}"\n\n'
-                        "Retrieved evidence:\n"
-                        f"{tool_result}"
-                    ),
-                }
-            ]
-            attached_count = 0
-            for image_path in image_paths[: max(1, settings.mllm_max_images)]:
-                data_url = _image_path_to_data_url(image_path, settings.mllm_max_image_edge)
-                if not data_url:
-                    continue
-                multimodal_content.append({"type": "image_url", "image_url": {"url": data_url}})
-                attached_count += 1
-            logging.getLogger(__name__).info(
-                "mllm_input mode=%s candidate_images=%d attached_images=%d",
-                settings.rag_mode.value,
-                len(image_paths),
-                attached_count,
-            )
-            user_payload = multimodal_content
-        else:
-            if include_images:
-                logging.getLogger(__name__).info(
-                    "mllm_input mode=%s candidate_images=0 attached_images=0",
-                    settings.rag_mode.value,
-                )
-            user_payload = (
+
+        if tool_name == "estimate_study_duration":
+            c2_payload = (
                 f'User request: "{user_query}"\n\n'
-                "Retrieved evidence:\n"
+                "Duration estimate:\n"
                 f"{tool_result}"
             )
-        prompt_messages = non_tool_messages + [
-            SystemMessage(
-                content=(
-                    "Given retrieved snippets for one course/week, list the main studied topics only. "
-                    "Do not mention unrelated details. If evidence is weak, say so.\n"
-                    "Output format:\n"
-                    "- 3-6 topic bullets\n"
-                    "- Optional short evidence note per topic using filename only in brackets, e.g. [lecture3.pdf]"
+            prompt_messages = non_tool_messages + [
+                SystemMessage(
+                    content=(
+                        "Produce a concise C2 duration estimate answer.\n"
+                        "Output format:\n"
+                        "- Estimated effort: minutes and suggested blocking\n"
+                        "- Confidence and rationale grounded in provided evidence\n"
+                        "- Optional next step: suggest calling C3 with required_minutes"
+                    )
+                ),
+                HumanMessage(content=c2_payload),
+            ]
+        elif tool_name == "find_free_slots":
+            c3_payload = (
+                f'User request: "{user_query}"\n\n'
+                "Free slots:\n"
+                f"{tool_result}"
+            )
+            prompt_messages = non_tool_messages + [
+                SystemMessage(
+                    content=(
+                        "Produce a concise C3 slot-finder answer.\n"
+                        "Summarize top slot options in bullets and mention if a split is needed."
+                    )
+                ),
+                HumanMessage(content=c3_payload),
+            ]
+        else:
+            image_paths = _extract_image_paths(tool_result)
+            include_images = settings.rag_mode in {
+                RAGPipelineMode.TEXT_RETRIEVAL_MLLM,
+                RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM,
+            }
+            user_payload: str | list[dict[str, Any]]
+            if include_images and image_paths:
+                multimodal_content: list[dict[str, Any]] = [
+                    {
+                        "type": "text",
+                        "text": (
+                            f'User request: "{user_query}"\n\n'
+                            "Retrieved evidence:\n"
+                            f"{tool_result}"
+                        ),
+                    }
+                ]
+                attached_count = 0
+                for image_path in image_paths[: max(1, settings.mllm_max_images)]:
+                    data_url = _image_path_to_data_url(image_path, settings.mllm_max_image_edge)
+                    if not data_url:
+                        continue
+                    multimodal_content.append({"type": "image_url", "image_url": {"url": data_url}})
+                    attached_count += 1
+                logging.getLogger(__name__).info(
+                    "mllm_input mode=%s candidate_images=%d attached_images=%d",
+                    settings.rag_mode.value,
+                    len(image_paths),
+                    attached_count,
                 )
-            ),
-            HumanMessage(content=user_payload),
-        ]
+                user_payload = multimodal_content
+            else:
+                if include_images:
+                    logging.getLogger(__name__).info(
+                        "mllm_input mode=%s candidate_images=0 attached_images=0",
+                        settings.rag_mode.value,
+                    )
+                user_payload = (
+                    f'User request: "{user_query}"\n\n'
+                    "Retrieved evidence:\n"
+                    f"{tool_result}"
+                )
+            prompt_messages = non_tool_messages + [
+                SystemMessage(
+                    content=(
+                        "Given retrieved snippets for one course/week, list the main studied topics only. "
+                        "Do not mention unrelated details. If evidence is weak, say so.\n"
+                        "Output format:\n"
+                        "- 3-6 topic bullets\n"
+                        "- Optional short evidence note per topic using filename only in brackets, e.g. [lecture3.pdf]"
+                    )
+                ),
+                HumanMessage(content=user_payload),
+            ]
     else:
-        prompt_messages = messages + [SYSTEM_PROMPT]
+        prompt_messages = messages
 
     response = get_llm().invoke(prompt_messages)
     return {"messages": messages + [response]}
@@ -717,7 +1320,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     logging.getLogger(__name__).info("PLANNER_RAG_MODE=%s", get_settings().rag_mode.value)
     print(f"[ablation] PLANNER_RAG_MODE={get_settings().rag_mode.value}")
-    print("\nPlanner agent (C1 only) ready. Type 'exit' to quit.\n")
+    print("\nPlanner agent (C1 + C2 + C3) ready. Type 'exit' to quit.\n")
     while True:
         user_text = input("You: ").strip()
         if user_text.lower() in {"exit", "quit"}:
