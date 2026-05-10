@@ -1,8 +1,9 @@
 """
-Minimal planner agent with three capabilities:
+Minimal planner agent with four capabilities:
 - C1 TopicSummary (topics studied in course/week from retrieved evidence)
 - C2 DurationEstimator (estimate study time for a course-related task)
 - C3 FreeSlotFinder (find open slots in a target week/day)
+- C4 StudyEnvironmentRecommender (suggest where to do a task)
 
 This module intentionally reuses already-built retrieval artifacts:
 - Chroma DB in `chroma_db` (dense index)
@@ -74,6 +75,25 @@ def _load_csv_rows(path: Path) -> list[dict[str, str]]:
     return [dict(row) for row in rows]
 
 
+def _load_jsonl_rows(path: Path) -> list[dict[str, Any]]:
+    """Load JSONL rows from disk as dictionaries."""
+    if not path.exists():
+        return []
+    output: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as jsonl_file:
+        for line in jsonl_file:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                output.append(payload)
+    return output
+
+
 def get_task_rows() -> list[dict[str, str]]:
     """Return cached planner task rows."""
     global _TASK_ROWS
@@ -106,6 +126,14 @@ def get_assignment_rows() -> list[dict[str, str]]:
     return _ASSIGNMENT_ROWS
 
 
+def get_study_environment_rows() -> list[dict[str, Any]]:
+    """Return cached study-environment metadata rows."""
+    global _STUDY_ENVIRONMENT_ROWS
+    if _STUDY_ENVIRONMENT_ROWS is None:
+        _STUDY_ENVIRONMENT_ROWS = _load_jsonl_rows(STUDY_ENVIRONMENTS_JSONL_PATH)
+    return _STUDY_ENVIRONMENT_ROWS
+
+
 COURSES_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "courses.csv"
 COURSES = load_courses(COURSES_CSV_PATH)
 
@@ -118,11 +146,13 @@ _TASK_ROWS: list[dict[str, str]] | None = None
 _DOCUMENT_ROWS: list[dict[str, str]] | None = None
 _DEPENDENCY_ROWS: list[dict[str, str]] | None = None
 _ASSIGNMENT_ROWS: list[dict[str, str]] | None = None
+_STUDY_ENVIRONMENT_ROWS: list[dict[str, Any]] | None = None
 
 TASKS_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "tasks.csv"
 DOCUMENTS_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "documents.csv"
 DEPENDENCIES_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "dependencies.csv"
 ASSIGNMENTS_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "assignments.csv"
+STUDY_ENVIRONMENTS_JSONL_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "study_environments.jsonl"
 
 DAY_TO_ABBR = {
     "monday": "Mon",
@@ -148,6 +178,12 @@ def get_settings() -> Settings:
     if _SETTINGS is None:
         _SETTINGS = load_settings()
     return _SETTINGS
+
+
+def _trace_log(message: str, *args: Any) -> None:
+    """Emit verbose pipeline trace logs when DEBUG_TRACE_ENABLED is set."""
+    if get_settings().debug_trace_enabled:
+        logging.getLogger(__name__).info("[trace] " + message, *args)
 
 
 class OpenCLIPBackbone:
@@ -230,15 +266,167 @@ def _detect_course_filter(query: str) -> str:
     return ""
 
 
+def _known_course_slugs() -> frozenset[str]:
+    """Dataset course ids as stored in chunk metadata (hyphenated slugs)."""
+    return frozenset(
+        str(row.get("course", "")).strip().lower()
+        for row in COURSES
+        if str(row.get("course", "")).strip()
+    )
+
+
+def _canonicalize_course_slug(raw: str) -> str:
+    """Normalize LLM/tool course strings toward metadata slugs (e.g. operations-research)."""
+    normalized = raw.strip().lower()
+    if not normalized:
+        return ""
+    normalized = re.sub(r"[\s_]+", "-", normalized)
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+    return normalized
+
+
+def _detect_course_from_composite(raw_value: str) -> str:
+    """Recover known course slugs embedded in larger composite strings."""
+    canonical = _canonicalize_course_slug(raw_value)
+    if not canonical:
+        return ""
+    canonical_compact = canonical.replace("-", "")
+    known = sorted(_known_course_slugs(), key=len, reverse=True)
+    for slug in known:
+        if slug in canonical:
+            return slug
+        if slug.replace("-", "") in canonical_compact:
+            return slug
+    return ""
+
+
+def _llm_detect_course_enum(raw_course_filter: str, query: str) -> str:
+    """Fallback course classifier constrained to known enum values."""
+    text = " ".join(part for part in [raw_course_filter.strip(), query.strip()] if part).strip()
+    if not text:
+        return ""
+    allowed = ("operations-research", "high-dimensional-data", "generative-ai", "unknown")
+    try:
+        raw_response = _render_assistant_content(
+            get_reasoning_llm().invoke(
+                [
+                    SystemMessage(
+                        content=(
+                            "Classify the course from the user text.\n"
+                            "Allowed course values only: operations-research, high-dimensional-data, "
+                            "generative-ai, unknown.\n"
+                            "Return strict JSON only with keys:\n"
+                            '- course: one of the allowed values\n'
+                            '- confidence: one of high, medium, low'
+                        )
+                    ),
+                    HumanMessage(content=f"text={text}"),
+                ]
+            ).content
+        )
+    except Exception as exc:
+        _trace_log("course_fallback.llm error=%s", exc)
+        return ""
+
+    payload = _extract_first_json_object(raw_response) or {}
+    course = str(payload.get("course", "")).strip().lower()
+    confidence = str(payload.get("confidence", "")).strip().lower()
+    _trace_log("course_fallback.llm course=%r confidence=%r text=%r", course, confidence, text)
+    if course not in allowed:
+        return ""
+    if course == "unknown":
+        return ""
+    if confidence == "high" or course != "unknown":
+        return course
+    return ""
+
+
+def _resolve_course_filter(
+    raw_course_filter: str,
+    query: str,
+    *,
+    filter_enabled: bool,
+) -> str:
+    """
+    Resolve course slug for Chroma/BM25 metadata filters.
+
+    Tool calls often pass human phrases ("operations research") while indexes store
+    slugs ("operations-research"). Match slugs first, then reuse alias scoring.
+    """
+    raw = raw_course_filter.strip()
+    canonical = _canonicalize_course_slug(raw)
+    known = _known_course_slugs()
+
+    if canonical and canonical in known:
+        return canonical
+
+    composite_match = _detect_course_from_composite(raw)
+    if composite_match:
+        _trace_log("course_resolve composite_match raw=%r -> %r", raw, composite_match)
+        return composite_match
+
+    if raw and filter_enabled:
+        detected = _detect_course_filter(raw)
+        if detected:
+            return detected
+
+    if filter_enabled and query.strip():
+        query_detected = _detect_course_filter(query)
+        if query_detected:
+            return query_detected
+        llm_detected = _llm_detect_course_enum(raw, query)
+        if llm_detected:
+            return llm_detected
+
+    return canonical
+
+
+_WEEK_WORD_TO_NUM: dict[str, int] = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
+
+def _canonicalize_week_filter(raw_value: str, allow_bare_number: bool = False) -> str:
+    """Normalize week-like inputs to canonical week tags (for example, week-04)."""
+    normalized = _normalize_for_match(raw_value)
+    if not normalized:
+        return ""
+
+    if re.fullmatch(r"easter[\s-]*week", normalized):
+        return "easter-week"
+
+    numeric_match = re.search(r"\b(?:week|wk|w)[\s\-_]*0*(\d{1,2})\b", normalized)
+    if numeric_match:
+        week_num = int(numeric_match.group(1))
+        return f"week-{week_num:02d}" if week_num > 0 else ""
+
+    word_options = "|".join(_WEEK_WORD_TO_NUM.keys())
+    word_match = re.search(rf"\b(?:week|wk|w)[\s\-_]*({word_options})\b", normalized)
+    if word_match:
+        return f"week-{_WEEK_WORD_TO_NUM[word_match.group(1)]:02d}"
+
+    if allow_bare_number:
+        bare_match = re.fullmatch(r"0*(\d{1,2})", normalized)
+        if bare_match:
+            week_num = int(bare_match.group(1))
+            return f"week-{week_num:02d}" if week_num > 0 else ""
+    return ""
+
+
 def _detect_week_filter(query: str) -> str:
     """Infer canonical week filter (week-XX) from free-form query text."""
-    match = re.search(r"\b(?:week|wk)[\s\-_]*(\d{1,2})\b", query.lower())
-    if not match:
-        return ""
-    week_num = int(match.group(1))
-    if week_num <= 0:
-        return ""
-    return f"week-{week_num:02d}"
+    return _canonicalize_week_filter(query, allow_bare_number=False)
 
 
 def _detect_day_filter(query: str) -> str:
@@ -258,24 +446,10 @@ def _normalize_day_filter(value: str) -> str:
 
 def _resolve_week_filter(raw_week_filter: str, query: str = "") -> str:
     """Resolve week filter from explicit input or query text."""
-    candidate = raw_week_filter.strip().lower()
+    candidate = _canonicalize_week_filter(raw_week_filter, allow_bare_number=True)
     if candidate:
         return candidate
     return _detect_week_filter(query)
-
-
-def _week_to_screenshot_stem(week_filter: str) -> str:
-    """Map canonical week tags to screenshot stems used by tasks.csv."""
-    normalized = week_filter.strip().lower()
-    if not normalized:
-        return ""
-    if normalized == "easter-week":
-        return "easter-week"
-    match = re.match(r"^week-(\d{1,2})$", normalized)
-    if not match:
-        return normalized
-    return f"week{int(match.group(1))}"
-
 
 def _parse_hhmm_to_minutes(value: str) -> int | None:
     """Parse HH:MM into minutes since midnight."""
@@ -333,24 +507,69 @@ def _extract_first_json_object(raw_text: str) -> dict[str, Any] | None:
     return None
 
 
-def _extract_marker_value(raw_text: str, marker: str) -> str:
-    """Extract a line marker value from tool output."""
-    for line in raw_text.splitlines():
-        if line.startswith(marker):
-            return line[len(marker) :].strip()
-    return ""
+def _truncate_for_log(value: Any, max_len: int = 280) -> str:
+    """Render a compact single-line preview for logs."""
+    text = str(value).replace("\n", " ").strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rstrip() + "..."
+
+
+def _log_missing_required_tool_args(tool_calls: Any) -> None:
+    """Warn only when required tool-call args are missing."""
+    if not isinstance(tool_calls, list):
+        return
+    required_by_tool = {
+        "kb_course_retrieval": ("query",),
+        "find_free_slots": ("week_filter",),
+    }
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        name = str(call.get("name", "")).strip()
+        args = call.get("args", {})
+        if not name or not isinstance(args, dict):
+            continue
+
+        if name == "estimate_study_duration":
+            task_query = str(args.get("task_query", "")).strip()
+            query = str(args.get("query", "")).strip()
+            if not task_query and not query:
+                logging.getLogger(__name__).warning(
+                    "tool_call missing_required_args tool=%s missing_any_of=task_query|query",
+                    name,
+                )
+            continue
+
+        if name == "recommend_study_environment":
+            task_query = str(args.get("task_query", "")).strip()
+            query = str(args.get("query", "")).strip()
+            if not task_query and not query:
+                logging.getLogger(__name__).warning(
+                    "tool_call missing_required_args tool=%s missing_any_of=task_query|query",
+                    name,
+                )
+            continue
+
+        required = required_by_tool.get(name, ())
+        missing = [arg for arg in required if not str(args.get(arg, "")).strip()]
+        if missing:
+            logging.getLogger(__name__).warning(
+                "tool_call missing_required_args tool=%s missing=%s",
+                name,
+                ",".join(missing),
+            )
 
 
 def _filter_tasks_for_week(task_rows: list[dict[str, str]], week_filter: str) -> list[dict[str, str]]:
     """Filter tasks.csv rows by dataset week tag."""
-    stem = _week_to_screenshot_stem(week_filter)
-    if not stem:
+    normalized_week = week_filter.strip().lower()
+    if not normalized_week:
         return []
     output: list[dict[str, str]] = []
     for row in task_rows:
-        screenshot = str(row.get("screenshot", "")).strip().lower()
-        screenshot_stem = Path(screenshot).stem
-        if screenshot_stem == stem:
+        row_week = str(row.get("week", "")).strip().lower()
+        if row_week == normalized_week:
             output.append(row)
     return output
 
@@ -430,6 +649,33 @@ class CourseRetriever:
     Runtime behavior:
     - reads from `chroma_db` and BM25 JSONL
     - never writes vectors/index rows
+
+    Metadata filtering pipeline (course / week on chunk metadata):
+
+    1. **Who sets filters?** Callers (`kb_course_retrieval`, `estimate_study_duration`)
+       resolve `course_filter` and `week_filter` from tool args + user text (see
+       `_resolve_course_filter`, `_resolve_week_filter`).
+
+    2. **Chroma dense search** (`text_chunks`): optional ``where`` from `_make_where`:
+       equality on `course` and/or `week`. If
+       ``Settings.retrieval_metadata_filter_enabled`` is False, ``where`` is None and
+       the vector query runs over the **full collection** (ranking = query embedding
+       similarity only).
+
+    3. **BM25**: lexical scores over the corpus, then **post-filters** by
+       `metadata.course` / `metadata.week` when those strings are non-empty. With
+       metadata filtering disabled, those filters are cleared so ranking is over **all**
+       BM25 rows that match the query tokens.
+
+    4. **RRF** merges dense and BM25 id lists; rows are hydrated from the BM25 table
+       (or Chroma `get` fallback).
+
+    5. **Multimodal mode** additionally queries `planner_images` with the same
+       ``where`` as dense text; `_multimodal_fuse_scores` blends text RRF scores with
+       per-page image similarity when chunk metadata links to an indexed page.
+
+    For small corpora, try **no metadata filters**: set
+    ``RETRIEVAL_METADATA_FILTER_ENABLED=0`` in the environment.
     """
 
     def __init__(self, settings: Settings):
@@ -485,7 +731,9 @@ class CourseRetriever:
 
     @staticmethod
     def _make_where(course_filter: str, week_filter: str) -> dict[str, Any] | None:
-        """Build optional Chroma metadata filter for course/week constraints."""
+        """Build Chroma ``where`` for metadata filtering (None = no filter, search all)."""
+        # Each clause is an exact match on indexed metadata fields. Combined with $and
+        # when both course and week are present. Callers pass "" to skip a dimension.
         clauses: list[dict[str, str]] = []
         if course_filter:
             clauses.append({"course": course_filter})
@@ -638,18 +886,38 @@ class CourseRetriever:
         return fused_hits
 
     def search(self, query: str, top_k: int, course_filter: str, week_filter: str) -> list[dict[str, Any]]:
-        """Hybrid retrieval with optional explicit metadata filters."""
-        where = self._make_where(course_filter=course_filter, week_filter=week_filter)
+        """Hybrid retrieval; optionally restrict by course/week metadata (see class docstring)."""
+        use_meta = self.settings.retrieval_metadata_filter_enabled
+        eff_course = course_filter if use_meta else ""
+        eff_week = week_filter if use_meta else ""
+        where = self._make_where(course_filter=eff_course, week_filter=eff_week)
+        _trace_log(
+            "retrieval.search query=%r top_k=%d use_meta=%s eff_course=%r eff_week=%r where=%s",
+            query,
+            max(1, int(top_k)),
+            use_meta,
+            eff_course,
+            eff_week,
+            where if where is not None else "none",
+        )
         dense_ids = self._dense_search(query, where=where, n_results=max(top_k, self.settings.dense_k))
         bm25_ids = self._bm25_search(
             query=query,
-            course_filter=course_filter,
-            week_filter=week_filter,
+            course_filter=eff_course,
+            week_filter=eff_week,
             n_results=max(top_k, self.settings.bm25_k),
+        )
+        _trace_log(
+            "retrieval.candidates dense=%d bm25=%d dense_head=%s bm25_head=%s",
+            len(dense_ids),
+            len(bm25_ids),
+            dense_ids[:3],
+            bm25_ids[:3],
         )
         fused_scores = _rrf_fuse(dense_ids, bm25_ids, k=max(1, self.settings.rrf_k))
         ranked_ids = sorted(fused_scores.keys(), key=lambda chunk_id: fused_scores[chunk_id], reverse=True)
         ranked_ids = ranked_ids[: max(1, top_k)]
+        _trace_log("retrieval.rrf ranked=%d ranked_head=%s", len(ranked_ids), ranked_ids[:3])
         text_hits = [self._hydrate_hit(chunk_id, score=fused_scores[chunk_id]) for chunk_id in ranked_ids]
 
         if self.settings.rag_mode != RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM:
@@ -661,6 +929,7 @@ class CourseRetriever:
             n_results=max(top_k, self.settings.multimodal_fusion_k),
         )
         multimodal_hits = self._multimodal_fuse_scores(text_hits=text_hits, image_scores=image_scores)
+        _trace_log("retrieval.multimodal final_hits=%d", len(multimodal_hits))
         return multimodal_hits[: max(1, top_k)]
 
 
@@ -674,7 +943,7 @@ def get_retriever() -> CourseRetriever:
 
 @tool
 def kb_course_retrieval(
-    query: str = "",
+    query: str,
     top_k: int = 6,
     course_filter: str = "",
     week_filter: str = "",
@@ -689,34 +958,44 @@ def kb_course_retrieval(
         week_filter: Optional explicit week filter (for example, week-03).
     """
     settings = get_settings()
-    explicit_course = course_filter.strip().lower()
-    resolved_course = explicit_course
-    if not resolved_course and settings.course_filter_enabled:
-        resolved_course = _detect_course_filter(query)
-    resolved_week = week_filter.strip().lower() or _detect_week_filter(query)
+    resolved_course = _resolve_course_filter(
+        course_filter,
+        query,
+        filter_enabled=settings.course_filter_enabled,
+    )
+    resolved_week = _resolve_week_filter(week_filter, query=query)
 
     normalized_query = query.strip()
     if not normalized_query:
-        fallback_parts = ["course materials"]
-        if resolved_course:
-            fallback_parts.append(resolved_course.replace("-", " "))
-        if resolved_week:
-            fallback_parts.append(resolved_week.replace("-", " "))
-        normalized_query = " ".join(fallback_parts)
+        return "COURSE_RETRIEVAL_RESULTS:\nquery field was missing."
+    _trace_log(
+        "c1.kb_course_retrieval query=%r tool_course=%r tool_week=%r resolved_course=%r resolved_week=%r",
+        normalized_query,
+        course_filter,
+        week_filter,
+        resolved_course,
+        resolved_week,
+    )
 
+    # resolved_* are always computed for the tool transcript; only applied inside
+    # CourseRetriever.search when settings.retrieval_metadata_filter_enabled is True.
     hits = get_retriever().search(
         query=normalized_query,
         top_k=max(1, int(top_k)),
         course_filter=resolved_course,
         week_filter=resolved_week,
     )
+    _trace_log("c1.retrieval hits=%d", len(hits))
 
     if not hits:
         return "COURSE_RETRIEVAL_RESULTS:\nNo grounded snippets found for the current filters."
 
     lines: list[str] = ["C1A_RETRIEVAL_RESULTS:"]
+    meta_on = settings.retrieval_metadata_filter_enabled
     lines.append(
-        f"Applied filters -> course={resolved_course or 'none'} | week={resolved_week or 'none'} | top_k={max(1, int(top_k))}"
+        f"Applied filters -> metadata_filter={'on' if meta_on else 'off'}"
+        f" | course={resolved_course or 'none'} | week={resolved_week or 'none'}"
+        f" | top_k={max(1, int(top_k))}"
     )
     image_paths: list[str] = []
     for rank, hit in enumerate(hits, start=1):
@@ -780,9 +1059,11 @@ def estimate_study_duration(
         return "C2_DURATION_ESTIMATE:\nquery field was missing."
 
     settings = get_settings()
-    resolved_course = course_filter.strip().lower()
-    if not resolved_course and settings.course_filter_enabled:
-        resolved_course = _detect_course_filter(normalized_task_query)
+    resolved_course = _resolve_course_filter(
+        course_filter,
+        normalized_task_query,
+        filter_enabled=settings.course_filter_enabled,
+    )
     resolved_week = _resolve_week_filter(week_filter, query=normalized_task_query)
     resolved_day = _normalize_day_filter(day_filter) or _detect_day_filter(normalized_task_query)
     outcome = target_outcome.strip().lower() or "unspecified"
@@ -860,6 +1141,14 @@ def estimate_study_duration(
     raw_response = _render_assistant_content(get_reasoning_llm().invoke(prompt_messages).content)
     payload = _extract_first_json_object(raw_response)
     if not payload or "estimated_minutes" not in payload:
+        logging.getLogger(__name__).warning(
+            "c2_estimator invalid_json_payload task_query=%s course=%s week=%s day=%s raw_response_preview=%s",
+            _truncate_for_log(normalized_task_query, 140),
+            resolved_course or "none",
+            resolved_week or "none",
+            resolved_day or "none",
+            _truncate_for_log(raw_response, 320),
+        )
         return (
             "C2_DURATION_ESTIMATE:\n"
             "Estimator did not return valid JSON output. "
@@ -869,6 +1158,11 @@ def estimate_study_duration(
     estimated_minutes = _clamp_int(_safe_int(payload.get("estimated_minutes"), 0), 30, 240)
     confidence = str(payload.get("confidence", "medium")).strip().lower()
     if confidence not in {"low", "medium", "high"}:
+        logging.getLogger(__name__).warning(
+            "c2_estimator invalid_confidence confidence=%s payload_preview=%s",
+            _truncate_for_log(payload.get("confidence", "")),
+            _truncate_for_log(payload, 240),
+        )
         confidence = "medium"
     rationale = str(payload.get("rationale", "")).strip() or "No rationale provided by estimator."
     suggested_blocking = str(payload.get("suggested_blocking", "")).strip() or f"1 x {estimated_minutes}min"
@@ -1044,20 +1338,259 @@ def find_free_slots(
     return "\n".join(lines)
 
 
-TOOLS = [kb_course_retrieval, estimate_study_duration, find_free_slots]
+def _query_study_environment_text_scores(
+    query: str,
+    top_k: int,
+) -> tuple[dict[str, float], dict[str, str]]:
+    """Query indexed text corpus and aggregate study-environment relevance by source image."""
+    retriever = get_retriever()
+    hits = retriever.search(
+        query=query,
+        top_k=max(8, int(top_k)),
+        course_filter="study-environment",
+        week_filter="",
+    )
+    by_source_score: dict[str, float] = {}
+    by_source_excerpt: dict[str, str] = {}
+    for hit in hits:
+        metadata = hit.get("metadata", {}) or {}
+        source_path = str(metadata.get("source_path", "")).strip().replace("\\", "/")
+        if not source_path:
+            continue
+        resource_type = str(metadata.get("resource_type", "")).strip().lower()
+        course = str(metadata.get("course", "")).strip().lower()
+        if "study-location-photos/" not in source_path and resource_type != "study_environment_photo":
+            continue
+        if course and course != "study-environment" and "study-location-photos/" not in source_path:
+            continue
+        score = float(hit.get("score", 0.0))
+        if score > float(by_source_score.get(source_path, 0.0)):
+            by_source_score[source_path] = score
+            snippet = str(hit.get("text", "")).replace("\n", " ").strip()
+            if snippet and snippet != "[IMAGE_NO_OCR]":
+                by_source_excerpt[source_path] = snippet[:220]
+    return by_source_score, by_source_excerpt
+
+
+def _query_study_environment_image_scores(query: str, top_k: int) -> dict[str, float]:
+    """Query indexed study-location photos in planner_images and return source_path scores."""
+    retriever = get_retriever()
+    if retriever.image_collection.count() <= 0:
+        return {}
+    query_embedding = retriever.backbone.encode_text([query])[0]
+    where = {"$and": [{"course": "study-environment"}, {"raw_folder": "study-location-photos"}]}
+    try:
+        results = retriever.image_collection.query(
+            query_embeddings=[query_embedding],
+            n_results=max(1, top_k),
+            where=where,
+            include=["distances", "metadatas"],
+        )
+    except Exception:
+        return {}
+
+    distances = ((results.get("distances") or [[]])[0] or [])
+    metadatas = ((results.get("metadatas") or [[]])[0] or [])
+    image_scores: dict[str, float] = {}
+    for distance, metadata in zip(distances, metadatas):
+        if not isinstance(metadata, dict):
+            continue
+        source_path = str(metadata.get("relative_path", "")).strip().replace("\\", "/")
+        if not source_path:
+            continue
+        try:
+            score = 1.0 / (1.0 + float(distance))
+        except (TypeError, ValueError):
+            continue
+        prior = float(image_scores.get(source_path, 0.0))
+        if score > prior:
+            image_scores[source_path] = score
+    return image_scores
+
+
+@tool
+def recommend_study_environment(
+    task_query: str = "",
+    query: str = "",
+    top_k: int = 4,
+) -> str:
+    """
+    C4 environment recommender: choose where a task should be done.
+
+    Ablation behavior:
+    - text_only: uses study_environments.jsonl + indexed text retrieval for study-location photos.
+    - multimodal_retrieval_mllm: additionally scores original study-location photos from planner_images.
+    """
+    normalized_query = task_query.strip() or query.strip()
+    if not normalized_query:
+        return "C4_STUDY_ENVIRONMENT:\nquery field was missing."
+    env_rows = get_study_environment_rows()
+    if not env_rows:
+        return "C4_STUDY_ENVIRONMENT:\nNo study environments metadata found."
+
+    settings = get_settings()
+    text_scores, text_excerpts = _query_study_environment_text_scores(
+        normalized_query,
+        top_k=max(8, int(top_k) * 3),
+    )
+    multimodal_on = settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM
+    image_scores = (
+        _query_study_environment_image_scores(normalized_query, top_k=max(6, int(top_k) * 2))
+        if multimodal_on
+        else {}
+    )
+    query_terms = {
+        token
+        for token in re.findall(r"[a-z0-9]+", _normalize_for_match(normalized_query))
+        if len(token) >= 3
+    }
+    max_indexed_text_score = max(text_scores.values()) if text_scores else 0.0
+    candidates: list[dict[str, Any]] = []
+    for row in env_rows:
+        source_path = str(row.get("source_file_path", "")).strip().replace("\\", "/")
+        environment_type = str(row.get("environment_type", "")).strip().lower()
+        coarse_geo = str(row.get("coarse_geo", "")).strip().lower()
+
+        retrieved_excerpt = text_excerpts.get(source_path, "")
+        indexed_text_raw = float(text_scores.get(source_path, 0.0))
+        indexed_text_score = (
+            indexed_text_raw / max_indexed_text_score if max_indexed_text_score > 0 else 0.0
+        )
+        text_blob = f"{environment_type} {coarse_geo} {retrieved_excerpt}".lower()
+        overlap = sum(1 for term in query_terms if term in text_blob)
+        overlap_score = (overlap / max(1, len(query_terms))) if query_terms else 0.0
+        text_score = 0.65 * indexed_text_score + 0.35 * overlap_score
+        image_score = float(image_scores.get(source_path, 0.0))
+
+        # Retrieval confidence only. Final suitability decision is delegated to LLM.
+        retrieval_support_score = text_score
+        if multimodal_on:
+            retrieval_support_score = 0.65 * text_score + 0.35 * image_score
+        candidates.append(
+            {
+                "environment_id": str(row.get("environment_id", "")).strip(),
+                "source_file_path": source_path,
+                "coarse_geo": coarse_geo,
+                "environment_type": environment_type,
+                "text_score": text_score,
+                "image_score": image_score,
+                "retrieval_support_score": retrieval_support_score,
+                "text_excerpt": retrieved_excerpt[:220].strip(),
+            }
+        )
+    candidates.sort(key=lambda item: float(item.get("retrieval_support_score", 0.0)), reverse=True)
+    if not candidates:
+        return "C4_STUDY_ENVIRONMENT:\nNo candidate environments found."
+
+    llm_candidates = candidates[: max(3, min(8, int(top_k) * 2))]
+    llm_prompt = [
+        SystemMessage(
+            content=(
+                "You are selecting one best study environment for a task.\n"
+                "You only have sparse metadata (environment_type/coarse_geo) plus retrieval evidence.\n"
+                "Infer likely task fit factors (internet connection, natural light, interruptions, "
+                "noise, seating comfort) from available evidence. In multimodal mode, use image evidence when present.\n"
+                "Return strict JSON only with keys:\n"
+                "- environment_id (must be one of the candidates)\n"
+                "- confidence (high|medium|low)\n"
+                "- short_justification (1 sentence)\n"
+                "- factor_rationale (array of 2-4 short bullet strings)\n"
+                "Do not call tools."
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"task_query={normalized_query}\n"
+                f"rag_mode={settings.rag_mode.value}\n"
+                f"evidence_mode={'multimodal_index+images' if multimodal_on else 'text_index_only'}\n"
+                f"candidates_json={json.dumps(llm_candidates, ensure_ascii=True)}"
+            )
+        ),
+    ]
+    raw_selection = _render_assistant_content(get_reasoning_llm().invoke(llm_prompt).content)
+    parsed_selection = _extract_first_json_object(raw_selection) or {}
+    selected_environment_id = str(parsed_selection.get("environment_id", "")).strip()
+    selected = next(
+        (candidate for candidate in candidates if str(candidate.get("environment_id", "")) == selected_environment_id),
+        candidates[0],
+    )
+    factor_rationale = parsed_selection.get("factor_rationale", [])
+    rationale_items = [
+        str(item).strip()
+        for item in (factor_rationale if isinstance(factor_rationale, list) else [])
+        if str(item).strip()
+    ][:4]
+    short_justification = str(parsed_selection.get("short_justification", "")).strip()
+    confidence = str(parsed_selection.get("confidence", "")).strip().lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "medium"
+    recommendation = {
+        "environment_id": selected.get("environment_id", ""),
+        "environment_type": selected.get("environment_type", ""),
+        "coarse_geo": selected.get("coarse_geo", ""),
+        "source_file_path": selected.get("source_file_path", ""),
+        "justification": short_justification
+        or "Chosen by LLM based on factor fit and available retrieval evidence.",
+        "factor_rationale": rationale_items,
+        "confidence": confidence,
+    }
+
+    lines = [
+        "C4_STUDY_ENVIRONMENT:",
+        (
+            f"Applied mode -> rag_mode={settings.rag_mode.value} | "
+            f"evidence_mode={'multimodal_index+images' if multimodal_on else 'text_index_only'} | top_k={max(1, int(top_k))}"
+        ),
+        f"query={normalized_query}",
+        "Top candidates:",
+    ]
+    for rank, candidate in enumerate(candidates[: max(1, int(top_k))], start=1):
+        lines.append(
+            (
+                f"{rank}. environment_id={candidate.get('environment_id', '')} "
+                f"type={candidate.get('environment_type', '')} "
+                f"geo={candidate.get('coarse_geo', '')} "
+                f"retrieval_support={float(candidate.get('retrieval_support_score', 0.0)):.3f} "
+                f"(text={float(candidate.get('text_score', 0.0)):.3f}, "
+                f"image={float(candidate.get('image_score', 0.0)):.3f})"
+            )
+        )
+        text_excerpt = str(candidate.get("text_excerpt", "")).strip()
+        if text_excerpt:
+            lines.append(f"   indexed_text_excerpt={text_excerpt}")
+    lines.append(f"LLM_SELECTION_JSON={json.dumps(parsed_selection, ensure_ascii=True)}")
+    lines.append(f"RECOMMENDATION_JSON={json.dumps(recommendation, ensure_ascii=True)}")
+
+    if multimodal_on:
+        image_paths: list[str] = []
+        for candidate in candidates[: max(1, min(int(top_k), 3))]:
+            rel = str(candidate.get("source_file_path", "")).strip()
+            if not rel:
+                continue
+            abs_path = (_BASE_DIR / rel).resolve()
+            if abs_path.exists():
+                image_paths.append(str(abs_path))
+        if image_paths:
+            lines.append(f"IMAGE_PATHS_JSON={json.dumps(image_paths, ensure_ascii=True)}")
+    return "\n".join(lines)
+
+
+TOOLS = [kb_course_retrieval, estimate_study_duration, find_free_slots, recommend_study_environment]
 
 
 SYSTEM_PROMPT = SystemMessage(
     content=(
-        "You are a study planner assistant with three capabilities.\n"
+        "You are a study planner assistant with four capabilities.\n"
         "C1 TopicSummary: summarize topics studied in a course/week using kb_course_retrieval.\n"
         "C2 DurationEstimator: estimate how many minutes a course-related task should take.\n"
         "C3 FreeSlotFinder: find open schedule slots in a target week/day given required_minutes.\n"
+        "C4 StudyEnvironmentRecommender: recommend the best study environment for a specific task using recommend_study_environment.\n"
         "Respect dataset week tags like week-01..week-07 and easter-week.\n"
         "Routing rules:\n"
         "- If user asks to estimate time/effort/duration, call estimate_study_duration first.\n"
         "- If user asks to summarize topics/content, call kb_course_retrieval first.\n"
         "- If user asks for scheduling availability, call find_free_slots first.\n"
+        "- If user asks where to do a task or asks for best study place/environment, call recommend_study_environment first.\n"
         "Always include required tool arguments."
     )
 )
@@ -1160,19 +1693,36 @@ def _image_path_to_data_url(path: str, max_edge: int) -> str:
 
 
 def agent_node(state: AgentState):
-    """LLM node: routes tool calls and composes final C1/C2/C3 responses."""
+    """LLM node: routes tool calls and composes final C1/C2/C3/C4 responses."""
     messages = state["messages"]
     user_query = _latest_user_text(messages)
+    _trace_log("agent_node enter last_message_type=%s user_query=%r", getattr(messages[-1], "type", "unknown"), user_query)
 
     if messages and getattr(messages[-1], "type", None) == "tool":
         settings = get_settings()
         tool_name = str(getattr(messages[-1], "name", "")).strip()
         tool_result = str(messages[-1].content)
-        if "query field was missing" in tool_result.lower() and user_query.strip():
+        _trace_log("agent_node tool_result name=%s preview=%r", tool_name, _truncate_for_log(tool_result, 180))
+        lower_tool_result = tool_result.lower()
+        missing_kb_query = (
+            tool_name == "kb_course_retrieval"
+            and (
+                "query field was missing" in lower_tool_result
+                or ("field required" in lower_tool_result and "query" in lower_tool_result)
+            )
+        )
+        kb_no_snippets = tool_name == "kb_course_retrieval" and (
+            "no grounded snippets found" in lower_tool_result
+        )
+        if (missing_kb_query or kb_no_snippets) and user_query.strip():
             logging.getLogger(__name__).warning(
-                "tool_retry missing_query -> retrying kb_course_retrieval with latest user query"
+                "tool_retry kb_course_retrieval -> retrying with latest user query only "
+                "(missing_query=%s empty_snippets=%s)",
+                bool(missing_kb_query),
+                bool(kb_no_snippets),
             )
             try:
+                _trace_log("agent_node retry kb_course_retrieval with query=%r", user_query.strip())
                 tool_result = str(
                     kb_course_retrieval.invoke(
                         {
@@ -1218,6 +1768,47 @@ def agent_node(state: AgentState):
                     )
                 ),
                 HumanMessage(content=c3_payload),
+            ]
+        elif tool_name == "recommend_study_environment":
+            c4_payload_text = (
+                f'User request: "{user_query}"\n\n'
+                "Environment recommendation evidence:\n"
+                f"{tool_result}"
+            )
+            image_paths = _extract_image_paths(tool_result)
+            include_images = settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM
+            c4_user_payload: str | list[dict[str, Any]]
+            if include_images and image_paths:
+                multimodal_content: list[dict[str, Any]] = [{"type": "text", "text": c4_payload_text}]
+                attached_count = 0
+                for image_path in image_paths[: max(1, settings.mllm_max_images)]:
+                    data_url = _image_path_to_data_url(image_path, settings.mllm_max_image_edge)
+                    if not data_url:
+                        continue
+                    multimodal_content.append({"type": "image_url", "image_url": {"url": data_url}})
+                    attached_count += 1
+                logging.getLogger(__name__).info(
+                    "mllm_input_c4 mode=%s candidate_images=%d attached_images=%d",
+                    settings.rag_mode.value,
+                    len(image_paths),
+                    attached_count,
+                )
+                c4_user_payload = multimodal_content
+            else:
+                c4_user_payload = c4_payload_text
+            prompt_messages = non_tool_messages + [
+                SystemMessage(
+                    content=(
+                        "Produce a concise C4 environment recommendation answer.\n"
+                        "Select exactly one environment from the evidence.\n"
+                        "Output format:\n"
+                        "- Recommended environment: environment_id and a short label\n"
+                        "- Why it fits: 1-2 short bullets grounded in factors "
+                        "(internet connection, natural light, interruptions, noise, seating comfort)\n"
+                        "- Optional caveat if confidence is not high."
+                    )
+                ),
+                HumanMessage(content=c4_user_payload),
             ]
         else:
             image_paths = _extract_image_paths(tool_result)
@@ -1278,6 +1869,10 @@ def agent_node(state: AgentState):
         prompt_messages = messages
 
     response = get_llm().invoke(prompt_messages)
+    _trace_log("agent_node llm_response has_tool_calls=%s", bool(getattr(response, "tool_calls", None)))
+    if getattr(response, "tool_calls", None):
+        _trace_log("agent_node tool_calls=%s", getattr(response, "tool_calls", None))
+    _log_missing_required_tool_args(getattr(response, "tool_calls", None))
     return {"messages": messages + [response]}
 
 
@@ -1320,7 +1915,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     logging.getLogger(__name__).info("PLANNER_RAG_MODE=%s", get_settings().rag_mode.value)
     print(f"[ablation] PLANNER_RAG_MODE={get_settings().rag_mode.value}")
-    print("\nPlanner agent (C1 + C2 + C3) ready. Type 'exit' to quit.\n")
+    print("\nPlanner agent (C1 + C2 + C3 + C4) ready. Type 'exit' to quit.\n")
     while True:
         user_text = input("You: ").strip()
         if user_text.lower() in {"exit", "quit"}:
