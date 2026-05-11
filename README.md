@@ -17,9 +17,22 @@ python planner_agent.py
 Environment variables (see `.env.example`):
 
 - `PLANNER_LLM_BACKEND`: `gemini` (default) or `ollama`
-- `PLANNER_RAG_MODE`: `text_only` | `text_retrieval_mllm` | `multimodal_retrieval_mllm` (controls whether `search_images` is allowed)
+- `RAG_MODE` (or `PLANNER_RAG_MODE`): `text_only` | `text_retrieval_mllm` | `multimodal_retrieval_mllm`
+- `TEXT_RETRIEVAL_STRATEGY`: `hybrid` | `dense_only`
 - `GEMINI_MODEL`, `GOOGLE_API_KEY` / `GEMINI_API_KEY` for Gemini
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL` for Ollama (e.g. `llava-phi3:3.8b`)
+
+### C2/C3 evidence-only ablation presets
+
+Use these runtime presets for capability ablations (no reindex required):
+
+- `RAG_MODE=text_only` + `TEXT_RETRIEVAL_STRATEGY=hybrid`
+- `RAG_MODE=text_retrieval_mllm` + `TEXT_RETRIEVAL_STRATEGY=hybrid`
+- `RAG_MODE=multimodal_retrieval_mllm` + `TEXT_RETRIEVAL_STRATEGY=hybrid`
+- Retrieval-strategy control inside any mode: set `TEXT_RETRIEVAL_STRATEGY=dense_only`
+
+Runtime guardrail:
+- `tasks.csv` is excluded from `planner_agent.py` evidence for C2/C3. Keep it for a separate evaluation pipeline.
 
 ## Repo layout
 

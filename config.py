@@ -28,6 +28,12 @@ class RAGPipelineMode(str, Enum):
     MULTIMODAL_RETRIEVAL_MLLM = "multimodal_retrieval_mllm"
 
 
+class TextRetrievalStrategy(str, Enum):
+    """Supported text retrieval strategies."""
+    HYBRID = "hybrid"
+    DENSE_ONLY = "dense_only"
+
+
 @dataclass(frozen=True)
 class Settings:
     """Runtime settings for the planner agent."""
@@ -42,6 +48,7 @@ class Settings:
 
     # Retrieval
     rag_mode: RAGPipelineMode
+    text_retrieval_strategy: TextRetrievalStrategy
     open_clip_model: str
     open_clip_pretrained: str
     text_collection_name: str
@@ -100,11 +107,21 @@ def load_settings() -> Settings:
     except ImportError:
         pass
 
-    mode_raw = (os.environ.get("PLANNER_RAG_MODE") or RAGPipelineMode.TEXT_RETRIEVAL_MLLM.value).strip().lower()
+    mode_raw = (
+        os.environ.get("RAG_MODE")
+        or os.environ.get("PLANNER_RAG_MODE")
+        or RAGPipelineMode.TEXT_RETRIEVAL_MLLM.value
+    ).strip().lower()
     rag_mode = (
         RAGPipelineMode(mode_raw)
         if mode_raw in {m.value for m in RAGPipelineMode}
         else RAGPipelineMode.TEXT_RETRIEVAL_MLLM
+    )
+    strategy_raw = (os.environ.get("TEXT_RETRIEVAL_STRATEGY") or TextRetrievalStrategy.HYBRID.value).strip().lower()
+    text_retrieval_strategy = (
+        TextRetrievalStrategy(strategy_raw)
+        if strategy_raw in {s.value for s in TextRetrievalStrategy}
+        else TextRetrievalStrategy.HYBRID
     )
 
     text_context_mode = (os.environ.get("TEXT_CONTEXT_MODE") or "metadata").strip().lower()
@@ -117,6 +134,7 @@ def load_settings() -> Settings:
         ollama_base_url=(os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/"),
         ollama_model=(os.environ.get("OLLAMA_MODEL") or "llava-phi3:3.8b").strip(),
         rag_mode=rag_mode,
+        text_retrieval_strategy=text_retrieval_strategy,
         open_clip_model=(os.environ.get("OPEN_CLIP_MODEL") or DEFAULT_OPENCLIP_MODEL).strip(),
         open_clip_pretrained=(os.environ.get("OPEN_CLIP_PRETRAINED") or DEFAULT_OPENCLIP_PRETRAINED).strip(),
         text_collection_name=(os.environ.get("TEXT_COLLECTION_NAME") or "text_chunks").strip(),

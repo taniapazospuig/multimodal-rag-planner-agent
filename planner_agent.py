@@ -36,7 +36,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from config import LLMBackend, RAGPipelineMode, Settings, load_settings
+from config import LLMBackend, RAGPipelineMode, Settings, TextRetrievalStrategy, load_settings
 from text_tokenization import LexicalTokenizerConfig, tokenize_for_bm25
 
 
@@ -94,36 +94,12 @@ def _load_jsonl_rows(path: Path) -> list[dict[str, Any]]:
     return output
 
 
-def get_task_rows() -> list[dict[str, str]]:
-    """Return cached planner task rows."""
-    global _TASK_ROWS
-    if _TASK_ROWS is None:
-        _TASK_ROWS = _load_csv_rows(TASKS_CSV_PATH)
-    return _TASK_ROWS
-
-
 def get_document_rows() -> list[dict[str, str]]:
     """Return cached KB document metadata rows."""
     global _DOCUMENT_ROWS
     if _DOCUMENT_ROWS is None:
         _DOCUMENT_ROWS = _load_csv_rows(DOCUMENTS_CSV_PATH)
     return _DOCUMENT_ROWS
-
-
-def get_dependency_rows() -> list[dict[str, str]]:
-    """Return cached task-to-assignment dependency rows."""
-    global _DEPENDENCY_ROWS
-    if _DEPENDENCY_ROWS is None:
-        _DEPENDENCY_ROWS = _load_csv_rows(DEPENDENCIES_CSV_PATH)
-    return _DEPENDENCY_ROWS
-
-
-def get_assignment_rows() -> list[dict[str, str]]:
-    """Return cached assignment metadata rows."""
-    global _ASSIGNMENT_ROWS
-    if _ASSIGNMENT_ROWS is None:
-        _ASSIGNMENT_ROWS = _load_csv_rows(ASSIGNMENTS_CSV_PATH)
-    return _ASSIGNMENT_ROWS
 
 
 def get_study_environment_rows() -> list[dict[str, Any]]:
@@ -142,16 +118,10 @@ _LLM = None
 _ESTIMATOR_LLM = None
 _RETRIEVER: "CourseRetriever | None" = None
 _OPENCLIP_BACKBONE: "OpenCLIPBackbone | None" = None
-_TASK_ROWS: list[dict[str, str]] | None = None
 _DOCUMENT_ROWS: list[dict[str, str]] | None = None
-_DEPENDENCY_ROWS: list[dict[str, str]] | None = None
-_ASSIGNMENT_ROWS: list[dict[str, str]] | None = None
 _STUDY_ENVIRONMENT_ROWS: list[dict[str, Any]] | None = None
 
-TASKS_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "tasks.csv"
 DOCUMENTS_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "documents.csv"
-DEPENDENCIES_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "dependencies.csv"
-ASSIGNMENTS_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "assignments.csv"
 STUDY_ENVIRONMENTS_JSONL_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "study_environments.jsonl"
 
 DAY_TO_ABBR = {
@@ -561,77 +531,6 @@ def _log_missing_required_tool_args(tool_calls: Any) -> None:
             )
 
 
-def _filter_tasks_for_week(task_rows: list[dict[str, str]], week_filter: str) -> list[dict[str, str]]:
-    """Filter tasks.csv rows by dataset week tag."""
-    normalized_week = week_filter.strip().lower()
-    if not normalized_week:
-        return []
-    output: list[dict[str, str]] = []
-    for row in task_rows:
-        row_week = str(row.get("week", "")).strip().lower()
-        if row_week == normalized_week:
-            output.append(row)
-    return output
-
-
-def _build_assignment_pressure_lines(course_filter: str, week_filter: str) -> list[str]:
-    """Summarize assignment pressure linked to tasks in the selected week/course."""
-    if not course_filter or not week_filter:
-        return []
-    week_tasks = [
-        row
-        for row in _filter_tasks_for_week(get_task_rows(), week_filter)
-        if str(row.get("course", "")).strip().lower() == course_filter
-    ]
-    if not week_tasks:
-        return []
-    task_ids = {str(row.get("task_id", "")).strip() for row in week_tasks}
-    assignment_by_id = {
-        str(row.get("assignment_id", "")).strip(): row
-        for row in get_assignment_rows()
-        if str(row.get("assignment_id", "")).strip()
-    }
-    week_dates: list[date] = []
-    for row in week_tasks:
-        try:
-            week_dates.append(datetime.strptime(str(row.get("date", "")), "%Y-%m-%d").date())
-        except ValueError:
-            continue
-    week_start = min(week_dates) if week_dates else None
-
-    linked_assignment_ids = {
-        str(dep.get("depends_on_assignment_id", "")).strip()
-        for dep in get_dependency_rows()
-        if str(dep.get("task_id", "")).strip() in task_ids
-    }
-    lines: list[str] = []
-    for assignment_id in sorted(linked_assignment_ids):
-        if not assignment_id:
-            continue
-        row = assignment_by_id.get(assignment_id)
-        if not row:
-            continue
-        due_raw = str(row.get("due_date", "")).strip()
-        due_date = None
-        if due_raw:
-            due_part = due_raw.split("T", maxsplit=1)[0].strip()
-            try:
-                due_date = datetime.strptime(due_part, "%Y-%m-%d").date()
-            except ValueError:
-                due_date = None
-        days_to_due = ""
-        if week_start and due_date:
-            days_to_due = f", days_to_due_from_week_start={int((due_date - week_start).days)}"
-        lines.append(
-            (
-                f"- assignment_id={assignment_id}, name={row.get('name', 'unknown')}, "
-                f"weight_pct={row.get('weight_pct', '')}, due_date={due_raw or 'na'}{days_to_due}, "
-                f"is_hurdle={row.get('is_hurdle', '')}"
-            )
-        )
-    return lines[:6]
-
-
 def _rrf_fuse(dense_ranked_ids: list[str], bm25_ranked_ids: list[str], k: int) -> dict[str, float]:
     """Fuse dense and lexical rankings with Reciprocal Rank Fusion."""
     scores: dict[str, float] = defaultdict(float)
@@ -644,38 +543,12 @@ def _rrf_fuse(dense_ranked_ids: list[str], bm25_ranked_ids: list[str], k: int) -
 
 class CourseRetriever:
     """
-    C1 retriever: hybrid dense + BM25 search on existing indexes.
-
-    Runtime behavior:
-    - reads from `chroma_db` and BM25 JSONL
-    - never writes vectors/index rows
-
-    Metadata filtering pipeline (course / week on chunk metadata):
-
-    1. **Who sets filters?** Callers (`kb_course_retrieval`, `estimate_study_duration`)
-       resolve `course_filter` and `week_filter` from tool args + user text (see
-       `_resolve_course_filter`, `_resolve_week_filter`).
-
-    2. **Chroma dense search** (`text_chunks`): optional ``where`` from `_make_where`:
-       equality on `course` and/or `week`. If
-       ``Settings.retrieval_metadata_filter_enabled`` is False, ``where`` is None and
-       the vector query runs over the **full collection** (ranking = query embedding
-       similarity only).
-
-    3. **BM25**: lexical scores over the corpus, then **post-filters** by
-       `metadata.course` / `metadata.week` when those strings are non-empty. With
-       metadata filtering disabled, those filters are cleared so ranking is over **all**
-       BM25 rows that match the query tokens.
-
-    4. **RRF** merges dense and BM25 id lists; rows are hydrated from the BM25 table
-       (or Chroma `get` fallback).
-
-    5. **Multimodal mode** additionally queries `planner_images` with the same
-       ``where`` as dense text; `_multimodal_fuse_scores` blends text RRF scores with
-       per-page image similarity when chunk metadata links to an indexed page.
-
-    For small corpora, try **no metadata filters**: set
-    ``RETRIEVAL_METADATA_FILTER_ENABLED=0`` in the environment.
+    Unified retrieval over existing indexes for C1/C2/C3.
+    Reads from Chroma `text_chunks`, Chroma `planner_images`, and BM25 JSONL.
+    Text ranking strategy is controlled by TEXT_RETRIEVAL_STRATEGY (hybrid|dense_only).
+    RAG_MODE controls whether image retrieval/fusion is applied
+    (multimodal_retrieval_mllm only) or text hits are returned directly.
+    Optional course/week metadata filtering is applied via Chroma where and BM25 post-filter.
     """
 
     def __init__(self, settings: Settings):
@@ -885,42 +758,101 @@ class CourseRetriever:
         )
         return fused_hits
 
-    def search(self, query: str, top_k: int, course_filter: str, week_filter: str) -> list[dict[str, Any]]:
-        """Hybrid retrieval; optionally restrict by course/week metadata (see class docstring)."""
+    def search_planner_images(self, query: str, top_k: int, week_filter: str) -> list[str]:
+        """Retrieve planner screenshot image paths for C3 multimodal extraction."""
+        if self.image_collection.count() <= 0:
+            return []
+        where = {"$and": [{"course": "personal-planner"}, {"resource_type": "planner_screenshot"}]}
+        if week_filter:
+            where["$and"].append({"week": week_filter})
+        query_embedding = self.backbone.encode_text([query])[0]
+        try:
+            results = self.image_collection.query(
+                query_embeddings=[query_embedding],
+                n_results=max(1, int(top_k)),
+                where=where,
+                include=["metadatas"],
+            )
+        except Exception:
+            return []
+        metadatas = ((results.get("metadatas") or [[]])[0] or [])
+        image_paths: list[str] = []
+        for metadata in metadatas:
+            if not isinstance(metadata, dict):
+                continue
+            candidate = str(metadata.get("path", "")).strip()
+            if not candidate:
+                rel = str(metadata.get("relative_path", "")).strip()
+                if rel:
+                    candidate = str((_BASE_DIR / rel).resolve())
+            if candidate and Path(candidate).exists():
+                image_paths.append(candidate)
+        unique_paths = list(dict.fromkeys(image_paths))
+        logging.getLogger(__name__).info("c3_debug planner_image_hits count=%d", len(unique_paths))
+        return unique_paths
+
+    def search(
+        self,
+        query: str,
+        top_k: int,
+        course_filter: str,
+        week_filter: str,
+        *,
+        strategy_override: TextRetrievalStrategy | None = None,
+        enable_multimodal_fusion: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run configured retrieval strategy with optional course/week filters."""
         use_meta = self.settings.retrieval_metadata_filter_enabled
         eff_course = course_filter if use_meta else ""
         eff_week = week_filter if use_meta else ""
         where = self._make_where(course_filter=eff_course, week_filter=eff_week)
+        strategy = strategy_override or self.settings.text_retrieval_strategy
         _trace_log(
-            "retrieval.search query=%r top_k=%d use_meta=%s eff_course=%r eff_week=%r where=%s",
+            "retrieval.search query=%r top_k=%d strategy=%s use_meta=%s eff_course=%r eff_week=%r where=%s",
             query,
             max(1, int(top_k)),
+            strategy.value,
             use_meta,
             eff_course,
             eff_week,
             where if where is not None else "none",
         )
-        dense_ids = self._dense_search(query, where=where, n_results=max(top_k, self.settings.dense_k))
-        bm25_ids = self._bm25_search(
-            query=query,
-            course_filter=eff_course,
-            week_filter=eff_week,
-            n_results=max(top_k, self.settings.bm25_k),
-        )
-        _trace_log(
-            "retrieval.candidates dense=%d bm25=%d dense_head=%s bm25_head=%s",
-            len(dense_ids),
-            len(bm25_ids),
-            dense_ids[:3],
-            bm25_ids[:3],
-        )
-        fused_scores = _rrf_fuse(dense_ids, bm25_ids, k=max(1, self.settings.rrf_k))
-        ranked_ids = sorted(fused_scores.keys(), key=lambda chunk_id: fused_scores[chunk_id], reverse=True)
-        ranked_ids = ranked_ids[: max(1, top_k)]
-        _trace_log("retrieval.rrf ranked=%d ranked_head=%s", len(ranked_ids), ranked_ids[:3])
-        text_hits = [self._hydrate_hit(chunk_id, score=fused_scores[chunk_id]) for chunk_id in ranked_ids]
+        dense_ids: list[str] = []
+        bm25_ids: list[str] = []
+        fused_scores: dict[str, float] = {}
 
-        if self.settings.rag_mode != RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM:
+        if strategy == TextRetrievalStrategy.DENSE_ONLY:
+            dense_ids = self._dense_search(query, where=where, n_results=max(top_k, self.settings.dense_k))
+            _trace_log("retrieval.candidates dense_only count=%d dense_head=%s", len(dense_ids), dense_ids[:3])
+            for rank, chunk_id in enumerate(dense_ids, start=1):
+                fused_scores[chunk_id] = 1.0 / float(rank)
+        else:
+            dense_ids = self._dense_search(query, where=where, n_results=max(top_k, self.settings.dense_k))
+            bm25_ids = self._bm25_search(
+                query=query,
+                course_filter=eff_course,
+                week_filter=eff_week,
+                n_results=max(top_k, self.settings.bm25_k),
+            )
+            _trace_log(
+                "retrieval.candidates hybrid dense=%d bm25=%d dense_head=%s bm25_head=%s",
+                len(dense_ids),
+                len(bm25_ids),
+                dense_ids[:3],
+                bm25_ids[:3],
+            )
+            fused_scores = _rrf_fuse(dense_ids, bm25_ids, k=max(1, self.settings.rrf_k))
+
+        ranked_ids = sorted(fused_scores.keys(), key=lambda chunk_id: fused_scores[chunk_id], reverse=True)[: max(1, top_k)]
+        _trace_log("retrieval.ranked strategy=%s count=%d head=%s", strategy.value, len(ranked_ids), ranked_ids[:3])
+        text_hits = [self._hydrate_hit(chunk_id, score=fused_scores.get(chunk_id, 0.0)) for chunk_id in ranked_ids]
+
+        multimodal_enabled = (
+            self.settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM
+            if enable_multimodal_fusion is None
+            else bool(enable_multimodal_fusion)
+        )
+        if not multimodal_enabled:
             return text_hits
 
         image_scores = self._image_search(
@@ -996,6 +928,8 @@ def kb_course_retrieval(
         f"Applied filters -> metadata_filter={'on' if meta_on else 'off'}"
         f" | course={resolved_course or 'none'} | week={resolved_week or 'none'}"
         f" | top_k={max(1, int(top_k))}"
+        f" | rag_mode={settings.rag_mode.value}"
+        f" | retrieval_strategy={settings.text_retrieval_strategy.value}"
     )
     image_paths: list[str] = []
     for rank, hit in enumerate(hits, start=1):
@@ -1044,16 +978,56 @@ def estimate_study_duration(
     day_filter: str = "",
     target_outcome: str = "",
 ) -> str:
-    """
-    C2 duration estimator: infer study minutes from grounded metadata and retrieved evidence.
+    """C2 duration estimator using behavior from active RAG mode."""
+    mode = get_settings().rag_mode
+    return _estimate_study_duration_mode(
+        task_query=task_query,
+        query=query,
+        course_filter=course_filter,
+        week_filter=week_filter,
+        day_filter=day_filter,
+        target_outcome=target_outcome,
+        mode_name=mode.value,
+    )
 
-    Args:
-        task_query: User task to estimate.
-        course_filter: Optional explicit course slug.
-        week_filter: Optional week tag (for example, week-03).
-        day_filter: Optional day constraint (for example, Tue).
-        target_outcome: Optional task intent hint (review, quiz, assignment, project).
-    """
+
+def _build_duration_prompt_payload(
+    *,
+    mode_name: str,
+    task_query: str,
+    outcome: str,
+    resolved_course: str,
+    resolved_week: str,
+    resolved_day: str,
+    doc_lines: list[str],
+    retrieval_lines: list[str],
+) -> str:
+    return (
+        f"mode_name={mode_name}\n"
+        f"task_query={task_query}\n"
+        f"target_outcome={outcome}\n"
+        f"resolved_course={resolved_course or 'none'}\n"
+        f"resolved_week={resolved_week or 'none'}\n"
+        f"resolved_day={resolved_day or 'none'}\n\n"
+        "documents.csv candidates:\n"
+        f"{chr(10).join(doc_lines) if doc_lines else '- none'}\n\n"
+        "retrieved course evidence snippets:\n"
+        f"{chr(10).join(retrieval_lines) if retrieval_lines else '- none'}\n"
+    )
+
+
+def _estimate_study_duration_mode(
+    *,
+    task_query: str,
+    query: str,
+    course_filter: str,
+    week_filter: str,
+    day_filter: str,
+    target_outcome: str,
+    mode_name: str,
+) -> str:
+    """Shared C2 implementation for the three RAG mode ablations."""
+    logger = logging.getLogger(__name__)
     normalized_task_query = task_query.strip() or query.strip()
     if not normalized_task_query:
         return "C2_DURATION_ESTIMATE:\nquery field was missing."
@@ -1067,21 +1041,40 @@ def estimate_study_duration(
     resolved_week = _resolve_week_filter(week_filter, query=normalized_task_query)
     resolved_day = _normalize_day_filter(day_filter) or _detect_day_filter(normalized_task_query)
     outcome = target_outcome.strip().lower() or "unspecified"
+    logger.info(
+        "c2_debug start mode=%s rag_mode=%s query=%r course_in=%r week_in=%r day_in=%r "
+        "resolved_course=%r resolved_week=%r resolved_day=%r outcome=%r",
+        mode_name,
+        settings.rag_mode.value,
+        _truncate_for_log(normalized_task_query, 180),
+        course_filter,
+        week_filter,
+        day_filter,
+        resolved_course,
+        resolved_week,
+        resolved_day,
+        outcome,
+    )
 
+    document_rows = get_document_rows()
     candidate_docs = [
         row
-        for row in get_document_rows()
+        for row in document_rows
         if (not resolved_course or str(row.get("course", "")).strip().lower() == resolved_course)
-        and (not resolved_week or str(row.get("week", "")).strip().lower() == resolved_week)
+        and (not resolved_week or str(row.get("week", "")).strip().lower() in {resolved_week, "na", ""})
+        and str(row.get("tags", "")).strip().lower() == "course-content"
     ][:20]
+    logger.info("c2_debug candidate_docs count=%d", len(candidate_docs))
     doc_lines: list[str] = []
     for row in candidate_docs[:8]:
+        source_path = str(row.get("source_path", "")).strip()
+        source_abs = (_BASE_DIR / source_path).resolve() if source_path else None
+        file_size_bytes = source_abs.stat().st_size if source_abs and source_abs.exists() else -1
         doc_lines.append(
             (
-                f"- doc_id={row.get('doc_id', '')}, title={row.get('title', '')}, "
-                f"resource_type={row.get('resource_type', '')}, modality={row.get('modality', '')}, "
-                f"difficulty={row.get('difficulty', '')}, cognitive_load={row.get('cognitive_load', '')}, "
-                f"course={row.get('course', '')}, week={row.get('week', '')}"
+                f"- doc_id={row.get('doc_id', '')}, "
+                f"course={row.get('course', '')}, week={row.get('week', '')}, "
+                f"file_size_bytes={file_size_bytes if file_size_bytes >= 0 else 'unknown'}"
             )
         )
 
@@ -1091,62 +1084,102 @@ def estimate_study_duration(
         course_filter=resolved_course,
         week_filter=resolved_week,
     )
+    logger.info(
+        "c2_debug retrieval_hits count=%d top_k=%d",
+        len(hits),
+        max(3, min(8, int(settings.hybrid_k))),
+    )
     retrieval_lines: list[str] = []
-    for hit in hits[:5]:
+    image_paths: list[str] = []
+    course_material_hits: list[dict[str, Any]] = []
+    for hit in hits:
+        course_material_hits.append(hit)
+
+    logger.info("c2_debug course_material_hits count=%d", len(course_material_hits))
+    for hit in course_material_hits[:6]:
         metadata = hit.get("metadata", {}) or {}
+        source_file = Path(str(metadata.get("source_path", "unknown"))).name
         snippet = str(hit.get("text", "")).replace("\n", " ").strip()
         if len(snippet) > 220:
             snippet = snippet[:220].rstrip() + "..."
         retrieval_lines.append(
             (
-                f"- source={Path(str(metadata.get('source_path', 'unknown'))).name}, "
-                f"resource_type={metadata.get('resource_type', '')}, difficulty_hint={metadata.get('difficulty', '')}, "
-                f"cognitive_hint={metadata.get('cognitive_load', '')}, snippet={snippet}"
+                f"- source={source_file}, "
+                f"score={float(hit.get('score', 0.0)):.5f}, snippet={snippet}"
             )
         )
-    pressure_lines = _build_assignment_pressure_lines(
-        course_filter=resolved_course,
-        week_filter=resolved_week,
+        page_image_path = str(metadata.get("page_image_path", "")).strip()
+        page_image_abs = str((_BASE_DIR / page_image_path).resolve()) if page_image_path else ""
+        if page_image_abs and Path(page_image_abs).exists():
+            image_paths.append(page_image_abs)
+    logger.info(
+        "c2_debug course_material_images count=%d multimodal_mode=%s",
+        len(image_paths),
+        settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM,
     )
 
-    prompt_messages = [
-        SystemMessage(
-            content=(
-                "You estimate study duration for a personal planner.\n"
-                "Use only the grounded evidence provided by the user.\n"
-                "Return strict JSON only with keys:\n"
-                "- estimated_minutes (integer)\n"
-                "- confidence (one of: low, medium, high)\n"
-                "- rationale (short string, mention key evidence signals)\n"
-                "- suggested_blocking (string, e.g., '2 x 60min').\n"
-                "Do not call any tools."
-            )
-        ),
-        HumanMessage(
-            content=(
-                f"task_query={normalized_task_query}\n"
-                f"target_outcome={outcome}\n"
-                f"resolved_course={resolved_course or 'none'}\n"
-                f"resolved_week={resolved_week or 'none'}\n"
-                f"resolved_day={resolved_day or 'none'}\n\n"
-                "documents.csv candidates:\n"
-                f"{chr(10).join(doc_lines) if doc_lines else '- none'}\n\n"
-                "retrieved evidence snippets:\n"
-                f"{chr(10).join(retrieval_lines) if retrieval_lines else '- none'}\n\n"
-                "assignment pressure summary:\n"
-                f"{chr(10).join(pressure_lines) if pressure_lines else '- none'}\n"
-            )
-        ),
-    ]
-    raw_response = _render_assistant_content(get_reasoning_llm().invoke(prompt_messages).content)
+    prompt_text = _build_duration_prompt_payload(
+        mode_name=mode_name,
+        task_query=normalized_task_query,
+        outcome=outcome,
+        resolved_course=resolved_course,
+        resolved_week=resolved_week,
+        resolved_day=resolved_day,
+        doc_lines=doc_lines,
+        retrieval_lines=retrieval_lines,
+    )
+    system_text = (
+        "You estimate study duration for a personal planner.\n"
+        "Use only grounded course-material evidence provided by the user "
+        "(documents metadata, retrieved text snippets, and optional rendered PDF images).\n"
+        "Infer task duration from document length signals and your own assessment of material difficulty.\n"
+        "Use file_size_bytes as the only metadata cue.\n"
+        "Explicitly mention the materials used for the estimate.\n"
+        "Return strict JSON only with keys:\n"
+        "- estimated_minutes (integer)\n"
+        "- confidence (one of: low, medium, high)\n"
+        "- rationale (short string, mention key evidence signals)\n"
+        "- suggested_blocking (string, e.g., '2 x 60min').\n"
+        "Do not call any tools."
+    )
+
+    if settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM and image_paths:
+        multimodal_payload: list[dict[str, Any]] = [{"type": "text", "text": prompt_text}]
+        for image_path in list(dict.fromkeys(image_paths))[: max(1, settings.mllm_max_images)]:
+            data_url = _image_path_to_data_url(image_path, settings.mllm_max_image_edge)
+            if not data_url:
+                continue
+            multimodal_payload.append({"type": "image_url", "image_url": {"url": data_url}})
+        llm_input = [
+            SystemMessage(content=system_text),
+            HumanMessage(content=multimodal_payload),
+        ]
+    else:
+        llm_input = [
+            SystemMessage(content=system_text),
+            HumanMessage(content=prompt_text),
+        ]
+    logger.info(
+        "c2_debug estimator_llm_invoke mode=%s multimodal_payload=%s images_attached=%d prompt_chars=%d",
+        mode_name,
+        settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM and bool(image_paths),
+        len(list(dict.fromkeys(image_paths))) if image_paths else 0,
+        len(prompt_text),
+    )
+
+    raw_response = _render_assistant_content(get_reasoning_llm().invoke(llm_input).content)
     payload = _extract_first_json_object(raw_response)
+    logger.info(
+        "c2_debug estimator_llm_response has_json=%s has_estimated_minutes=%s response_preview=%r",
+        bool(payload),
+        bool(payload and "estimated_minutes" in payload),
+        _truncate_for_log(raw_response, 220),
+    )
     if not payload or "estimated_minutes" not in payload:
         logging.getLogger(__name__).warning(
-            "c2_estimator invalid_json_payload task_query=%s course=%s week=%s day=%s raw_response_preview=%s",
+            "c2_estimator invalid_json_payload mode=%s task_query=%s raw_response_preview=%s",
+            mode_name,
             _truncate_for_log(normalized_task_query, 140),
-            resolved_course or "none",
-            resolved_week or "none",
-            resolved_day or "none",
             _truncate_for_log(raw_response, 320),
         )
         return (
@@ -1155,14 +1188,9 @@ def estimate_study_duration(
             "Ask the agent to retry the duration estimation."
         )
 
-    estimated_minutes = _clamp_int(_safe_int(payload.get("estimated_minutes"), 0), 30, 240)
+    estimated_minutes = _safe_int(payload.get("estimated_minutes"), 0)
     confidence = str(payload.get("confidence", "medium")).strip().lower()
     if confidence not in {"low", "medium", "high"}:
-        logging.getLogger(__name__).warning(
-            "c2_estimator invalid_confidence confidence=%s payload_preview=%s",
-            _truncate_for_log(payload.get("confidence", "")),
-            _truncate_for_log(payload, 240),
-        )
         confidence = "medium"
     rationale = str(payload.get("rationale", "")).strip() or "No rationale provided by estimator."
     suggested_blocking = str(payload.get("suggested_blocking", "")).strip() or f"1 x {estimated_minutes}min"
@@ -1176,8 +1204,8 @@ def estimate_study_duration(
     lines = [
         "C2_DURATION_ESTIMATE:",
         (
-            f"Applied filters -> course={resolved_course or 'none'} | "
-            f"week={resolved_week or 'none'} | day={resolved_day or 'none'} | outcome={outcome}"
+            f"Applied filters -> mode={mode_name} | retrieval_strategy={settings.text_retrieval_strategy.value} | "
+            f"course={resolved_course or 'none'} | week={resolved_week or 'none'} | day={resolved_day or 'none'} | outcome={outcome}"
         ),
         f"REQUIRED_MINUTES={estimated_minutes}",
         f"RESOLVED_WEEK_FILTER={resolved_week or ''}",
@@ -1187,78 +1215,236 @@ def estimate_study_duration(
     return "\n".join(lines)
 
 
-@tool
-def find_free_slots(
+def _build_c3_planner_query(resolved_week: str, resolved_day: str) -> str:
+    """Compose an OCR-aligned retrieval query for planner screenshot extraction."""
+    day_scope = resolved_day or "Mon Tue Wed Thu Fri Sat Sun"
+    return (
+        f"Personal planner screenshot for {resolved_week}. "
+        f"Calendar with day labels ({day_scope}) and time grid (07:00-21:00). "
+        "Retrieve busy events only."
+    )
+
+
+def _extract_events_from_planner_screenshots(
+    *,
+    query: str,
     week_filter: str,
-    required_minutes: int,
-    day_filter: str = "",
-    min_slot_minutes: int = 30,
-    day_start: str = "07:00",
-    day_end: str = "22:00",
-) -> str:
-    """
-    C3 free slot finder: compute free planner intervals in a target week/day.
-
-    Args:
-        week_filter: Dataset week tag (week-01..week-07 or easter-week).
-        required_minutes: Estimated study minutes to fit.
-        day_filter: Optional day (Mon/Tue/...).
-        min_slot_minutes: Minimum candidate slot duration.
-        day_start: Day bound start (HH:MM).
-        day_end: Day bound end (HH:MM).
-    """
-    resolved_week = _resolve_week_filter(week_filter)
-    if not resolved_week:
-        return "C3_FREE_SLOTS:\nweek_filter field was missing."
-
-    resolved_day = _normalize_day_filter(day_filter)
-    required = _clamp_int(_safe_int(required_minutes, 60), 15, 360)
-    min_slot = _clamp_int(_safe_int(min_slot_minutes, 30), 15, 240)
-    start_min = _parse_hhmm_to_minutes(day_start)
-    end_min = _parse_hhmm_to_minutes(day_end)
-    if start_min is None or end_min is None or start_min >= end_min:
-        return "C3_FREE_SLOTS:\nInvalid day_start/day_end bounds."
-
-    week_rows = _filter_tasks_for_week(get_task_rows(), resolved_week)
-    if resolved_day:
-        week_rows = [row for row in week_rows if str(row.get("day", "")).strip() == resolved_day]
-    if not week_rows:
-        return (
-            "C3_FREE_SLOTS:\n"
-            f"Applied filters -> week={resolved_week} | day={resolved_day or 'all'}\n"
-            "No planner rows matched the selected week/day."
+    day_filter: str,
+    top_k: int,
+    include_images: bool,
+) -> list[dict[str, Any]]:
+    """Extract planner events from indexed planner screenshot OCR snippets."""
+    logger = logging.getLogger(__name__)
+    settings = get_settings()
+    normalized_week = week_filter.strip().lower()
+    logger.info(
+        "c2_debug screenshot_extract start query=%r week_filter=%r day_filter=%r top_k=%d include_images=%s",
+        _truncate_for_log(query, 180),
+        normalized_week,
+        day_filter,
+        max(6, int(top_k)),
+        include_images,
+    )
+    snippet_lines: list[str] = []
+    image_paths: list[str] = []
+    hits = get_retriever().search(
+        query=query,
+        top_k=max(6, int(top_k)),
+        course_filter="personal-planner",
+        week_filter=normalized_week,
+        strategy_override=TextRetrievalStrategy.DENSE_ONLY,
+        enable_multimodal_fusion=False,
+    )
+    logger.info("c2_debug screenshot_extract retrieval_hits count=%d", len(hits))
+    for hit in hits:
+        metadata = hit.get("metadata", {}) or {}
+        if str(metadata.get("resource_type", "")).strip().lower() != "planner_screenshot":
+            continue
+        source = Path(str(metadata.get("source_path", "unknown"))).name
+        snippet = str(hit.get("text", "")).replace("\n", " ").strip()
+        snippet = re.sub(r"\s+", " ", snippet)
+        if len(snippet) > 360:
+            snippet = snippet[:360].rstrip() + "..."
+        snippet_lines.append(f"- source={source}, snippet={snippet}")
+        source_path = str(metadata.get("source_path", "")).strip()
+        source_abs = str((_BASE_DIR / source_path).resolve()) if source_path else ""
+        if source_abs and Path(source_abs).exists():
+            image_paths.append(source_abs)
+    if include_images:
+        image_paths.extend(
+            get_retriever().search_planner_images(
+                query=query,
+                top_k=max(1, int(top_k)),
+                week_filter=normalized_week,
+            )
         )
+    image_paths = list(dict.fromkeys(image_paths))
+    logger.info(
+        "c2_debug screenshot_extract planner_hits=%d image_candidates=%d",
+        len(snippet_lines),
+        len(image_paths),
+    )
+    if not snippet_lines and not image_paths:
+        logger.info("c2_debug screenshot_extract no_snippets -> return []")
+        return []
 
-    by_date: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
-    parsed_dates: list[date] = []
-    for row in week_rows:
-        date_value = str(row.get("date", "")).strip()
-        if not date_value:
-            continue
-        try:
-            parsed_dates.append(datetime.strptime(date_value, "%Y-%m-%d").date())
-        except ValueError:
-            continue
-    if parsed_dates:
-        cursor_date = min(parsed_dates)
-        max_date = max(parsed_dates)
-        while cursor_date <= max_date:
-            day_abbr = cursor_date.strftime("%a")
-            if not resolved_day or day_abbr == resolved_day:
-                by_date[(cursor_date.isoformat(), day_abbr)] = []
-            cursor_date = date.fromordinal(cursor_date.toordinal() + 1)
+    system_text = (
+        "Extract calendar-like busy events from planner evidence.\n"
+        "Return strict JSON only with this schema:\n"
+        "{ \"events\": [\n"
+        "  {\"date\":\"YYYY-MM-DD or empty\", \"day\":\"Mon/Tue/... or empty\", "
+        "\"start_time\":\"HH:MM\", \"end_time\":\"HH:MM\", "
+        "\"title\":\"short\", \"course\":\"slug or empty\"}\n"
+        "]}\n"
+        "Rules:\n"
+        "- Keep only events that have start_time and end_time.\n"
+        "- Use 24-hour HH:MM.\n"
+        "- Do not invent missing values.\n"
+        "- Preserve uncertainty by leaving date/day/course empty when unknown."
+    )
+    if include_images:
+        system_text += (
+            "\nMultimodal guidance:\n"
+            "- Filled calendar blocks indicate busy events.\n"
+            "- Empty background gaps between busy blocks indicate potential free time.\n"
+            "- Extract only busy events; do not output free slots.\n"
+            "- Be robust to display themes (do not assume only white backgrounds)."
+        )
+    snippets_payload = f"{chr(10).join(snippet_lines[:14])}" if snippet_lines else "- no reliable OCR snippets provided"
+    prompt_text = (
+        f"week_filter={normalized_week or 'none'}\n"
+        f"day_filter={day_filter or 'none'}\n"
+        f"query={query}\n\n"
+        "planner_context:\n"
+        f"{snippets_payload}"
+    )
+    attached_images = 0
+    if include_images and image_paths:
+        multimodal_payload: list[dict[str, Any]] = [{"type": "text", "text": prompt_text}]
+        for image_path in list(dict.fromkeys(image_paths))[: max(1, settings.mllm_max_images)]:
+            data_url = _image_path_to_data_url(image_path, settings.mllm_max_image_edge)
+            if not data_url:
+                continue
+            multimodal_payload.append({"type": "image_url", "image_url": {"url": data_url}})
+            attached_images += 1
+        messages = [SystemMessage(content=system_text), HumanMessage(content=multimodal_payload)]
+    else:
+        messages = [SystemMessage(content=system_text), HumanMessage(content=prompt_text)]
 
+    logger.info(
+        "c2_debug screenshot_extract llm_invoke multimodal_payload=%s images_attached=%d prompt_chars=%d",
+        include_images and attached_images > 0,
+        attached_images,
+        len(prompt_text),
+    )
+    raw = _render_assistant_content(get_reasoning_llm().invoke(messages).content)
+    parsed = _extract_first_json_object(raw) or {}
+    events = parsed.get("events", [])
+    logger.info(
+        "c2_debug screenshot_extract llm_response has_json=%s raw_events_type=%s raw_events_count=%s preview=%r",
+        bool(parsed),
+        type(events).__name__,
+        len(events) if isinstance(events, list) else "n/a",
+        _truncate_for_log(raw, 220),
+    )
+    if not isinstance(events, list):
+        return []
+
+    cleaned: list[dict[str, Any]] = []
+    for item in events:
+        if not isinstance(item, dict):
+            continue
+        start_time = str(item.get("start_time", "")).strip()
+        end_time = str(item.get("end_time", "")).strip()
+        if _parse_hhmm_to_minutes(start_time) is None or _parse_hhmm_to_minutes(end_time) is None:
+            continue
+        start_min = _parse_hhmm_to_minutes(start_time)
+        end_min = _parse_hhmm_to_minutes(end_time)
+        if start_min is None or end_min is None or end_min <= start_min:
+            continue
+        day_value = _normalize_day_filter(str(item.get("day", "")).strip())
+        if day_filter and day_value and day_value != day_filter:
+            continue
+        cleaned.append(
+            {
+                "date": str(item.get("date", "")).strip(),
+                "day": day_value,
+                "start_time": start_time,
+                "end_time": end_time,
+                "title": str(item.get("title", "")).strip(),
+                "course": _canonicalize_course_slug(str(item.get("course", "")).strip()),
+                "duration_minutes": end_min - start_min,
+            }
+        )
+    logger.info("c2_debug screenshot_extract cleaned_events count=%d", len(cleaned))
+    return cleaned
+
+
+def _compute_free_slots_from_rows(
+    *,
+    week_rows: list[dict[str, str]],
+    resolved_week: str,
+    resolved_day: str,
+    required: int,
+    min_slot: int,
+    start_min: int,
+    end_min: int,
+    day_start: str,
+    day_end: str,
+    mode_name: str,
+) -> str:
+    """Compute free slots from normalized busy intervals."""
+    settings = get_settings()
+    normalized_rows: list[dict[str, Any]] = []
     for row in week_rows:
-        date_value = str(row.get("date", "")).strip()
-        day_value = str(row.get("day", "")).strip()
+        raw_day = _normalize_day_filter(str(row.get("day", "")).strip())
+        raw_date = str(row.get("date", "")).strip()
+        parsed_date: date | None = None
+        if raw_date:
+            try:
+                parsed_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+            except ValueError:
+                parsed_date = None
+
+        day_value = raw_day or (parsed_date.strftime("%a") if parsed_date else "")
+        if resolved_day and day_value and day_value != resolved_day:
+            continue
+        if not parsed_date and not day_value:
+            continue
+
         task_start = _parse_hhmm_to_minutes(str(row.get("start_time", "")))
         task_end = _parse_hhmm_to_minutes(str(row.get("end_time", "")))
         if task_start is None or task_end is None or task_end <= task_start:
             continue
+
         clipped_start = max(start_min, task_start)
         clipped_end = min(end_min, task_end)
         if clipped_end <= clipped_start:
             continue
+
+        date_key = parsed_date.isoformat() if parsed_date else f"{resolved_week}|{day_value or 'UNK'}"
+        normalized_rows.append(
+            {
+                "date": date_key,
+                "day": day_value,
+                "start": clipped_start,
+                "end": clipped_end,
+            }
+        )
+
+    if not normalized_rows:
+        return (
+            "C3_FREE_SLOTS:\n"
+            f"Applied filters -> mode={mode_name} | week={resolved_week} | day={resolved_day or 'all'}\n"
+            "No planner rows matched the selected week/day."
+        )
+
+    by_date: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
+    for row in normalized_rows:
+        day_value = str(row.get("day", "")).strip() or (resolved_day or "UNK")
+        date_value = str(row.get("date", "")).strip()
+        clipped_start = int(row.get("start", 0))
+        clipped_end = int(row.get("end", 0))
         by_date[(date_value, day_value)].append((clipped_start, clipped_end))
 
     slots: list[dict[str, Any]] = []
@@ -1301,19 +1487,18 @@ def find_free_slots(
     if not slots:
         return (
             "C3_FREE_SLOTS:\n"
-            f"Applied filters -> week={resolved_week} | day={resolved_day or 'all'}\n"
+            f"Applied filters -> mode={mode_name} | week={resolved_week} | day={resolved_day or 'all'}\n"
             "No free slots found within the selected day bounds."
         )
 
     fitting = [slot for slot in slots if bool(slot.get("fits_required"))]
     fitting.sort(key=lambda slot: (str(slot.get("date")), int(slot.get("start", 0)), -int(slot.get("duration", 0))))
     partial = sorted(slots, key=lambda slot: int(slot.get("duration", 0)), reverse=True)
-
     lines = [
         "C3_FREE_SLOTS:",
         (
-            f"Applied filters -> week={resolved_week} | day={resolved_day or 'all'} | "
-            f"required_minutes={required} | day_bounds={day_start}-{day_end}"
+            f"Applied filters -> mode={mode_name} | retrieval_strategy={settings.text_retrieval_strategy.value} | "
+            f"week={resolved_week} | day={resolved_day or 'all'} | required_minutes={required} | day_bounds={day_start}-{day_end}"
         ),
     ]
     if fitting:
@@ -1336,6 +1521,101 @@ def find_free_slots(
             )
     lines.append(f"SLOTS_JSON={json.dumps(slots[:20], ensure_ascii=True)}")
     return "\n".join(lines)
+
+
+def _find_free_slots_from_mode(
+    *,
+    week_filter: str,
+    required_minutes: int,
+    day_filter: str,
+    min_slot_minutes: int,
+    day_start: str,
+    day_end: str,
+    mode_name: str,
+) -> str:
+    """Shared C3 implementation using evidence-only planner screenshot retrieval."""
+    c3_mode_name = (
+        RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM.value
+        if get_settings().rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM
+        else RAGPipelineMode.TEXT_ONLY.value
+    )
+    resolved_week = _resolve_week_filter(week_filter)
+    if not resolved_week:
+        return "C3_FREE_SLOTS:\nweek_filter field was missing."
+
+    resolved_day = _normalize_day_filter(day_filter)
+    required = _safe_int(required_minutes, 60)
+    min_slot = _safe_int(min_slot_minutes, 30)
+    start_min = _parse_hhmm_to_minutes(day_start)
+    end_min = _parse_hhmm_to_minutes(day_end)
+    if start_min is None or end_min is None or start_min >= end_min:
+        return "C3_FREE_SLOTS:\nInvalid day_start/day_end bounds."
+
+    extracted = _extract_events_from_planner_screenshots(
+        query=_build_c3_planner_query(resolved_week, resolved_day),
+        week_filter=resolved_week,
+        day_filter=resolved_day,
+        top_k=max(12, int(get_settings().hybrid_k) * 3),
+        include_images=c3_mode_name == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM.value,
+    )
+    if c3_mode_name == RAGPipelineMode.TEXT_ONLY.value and not resolved_day:
+        date_anchored = sum(
+            1
+            for item in extracted
+            if isinstance(item, dict)
+            and bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(item.get("date", "")).strip()))
+        )
+        if date_anchored == 0:
+            return (
+                "C3_FREE_SLOTS:\n"
+                f"Applied filters -> mode={c3_mode_name} | week={resolved_week} | day=all\n"
+                "Insufficient planner evidence to compute reliable free slots in text_only mode. "
+                "Try multimodal mode."
+            )
+    week_rows = [
+        {
+            "date": str(item.get("date", "")).strip(),
+            "day": str(item.get("day", "")).strip(),
+            "start_time": str(item.get("start_time", "")).strip(),
+            "end_time": str(item.get("end_time", "")).strip(),
+            "title": str(item.get("title", "")).strip(),
+        }
+        for item in extracted
+    ]
+    return _compute_free_slots_from_rows(
+        week_rows=week_rows,
+        resolved_week=resolved_week,
+        resolved_day=resolved_day,
+        required=required,
+        min_slot=min_slot,
+        start_min=start_min,
+        end_min=end_min,
+        day_start=day_start,
+        day_end=day_end,
+        mode_name=c3_mode_name,
+    )
+
+
+@tool
+def find_free_slots(
+    week_filter: str,
+    required_minutes: int,
+    day_filter: str = "",
+    min_slot_minutes: int = 30,
+    day_start: str = "07:00",
+    day_end: str = "22:00",
+) -> str:
+    """C3 free-slot finder using behavior from active RAG mode."""
+    mode = get_settings().rag_mode
+    return _find_free_slots_from_mode(
+        week_filter=week_filter,
+        required_minutes=required_minutes,
+        day_filter=day_filter,
+        min_slot_minutes=min_slot_minutes,
+        day_start=day_start,
+        day_end=day_end,
+        mode_name=mode.value,
+    )
 
 
 def _query_study_environment_text_scores(
@@ -1697,15 +1977,15 @@ SYSTEM_PROMPT = SystemMessage(
     content=(
         "You are a study planner assistant with four capabilities.\n"
         "C1 TopicSummary: summarize topics studied in a course/week using kb_course_retrieval.\n"
-        "C2 DurationEstimator: estimate how many minutes a course-related task should take.\n"
-        "C3 FreeSlotFinder: find open schedule slots in a target week/day given required_minutes.\n"
+        "C2 DurationEstimator: estimate task minutes with estimate_study_duration.\n"
+        "C3 FreeSlotFinder: find open schedule slots with find_free_slots.\n"
         "C4 StudyEnvironment: use recommend_study_environment to choose where to work, "
         "or assess_study_environment_fit to judge a specific environment.\n"
         "Respect dataset week tags like week-01..week-07 and easter-week.\n"
         "Routing rules:\n"
-        "- If user asks to estimate time/effort/duration, call estimate_study_duration first.\n"
+        "- If user asks to estimate duration, call estimate_study_duration.\n"
         "- If user asks to summarize topics/content, call kb_course_retrieval first.\n"
-        "- If user asks for scheduling availability, call find_free_slots first.\n"
+        "- If user asks for free slots, call find_free_slots.\n"
         "- If user asks where to do a task or asks for best study place/environment, call recommend_study_environment first.\n"
         "- If user asks 'Is it a good idea to do this task in [environment]?', call assess_study_environment_fit first and preserve the environment mention in environment_hint.\n"
         "Always include required tool arguments."
@@ -2007,6 +2287,15 @@ def agent_node(state: AgentState):
         prompt_messages = messages
 
     response = get_llm().invoke(prompt_messages)
+    if getattr(response, "tool_calls", None):
+        tool_names = [str(call.get("name", "")).strip() for call in response.tool_calls if isinstance(call, dict)]
+        logging.getLogger(__name__).info(
+            "agent_loop_debug model_requested_tools count=%d names=%s",
+            len(response.tool_calls),
+            tool_names,
+        )
+    else:
+        logging.getLogger(__name__).info("agent_loop_debug model_requested_tools count=0")
     _trace_log("agent_node llm_response has_tool_calls=%s", bool(getattr(response, "tool_calls", None)))
     if getattr(response, "tool_calls", None):
         _trace_log("agent_node tool_calls=%s", getattr(response, "tool_calls", None))
@@ -2018,7 +2307,18 @@ def route_after_agent(state: AgentState):
     """Route to tool execution if the model emitted tool calls."""
     last = state["messages"][-1]
     if hasattr(last, "tool_calls") and last.tool_calls:
+        tool_names = [
+            str(call.get("name", "")).strip()
+            for call in (last.tool_calls if isinstance(last.tool_calls, list) else [])
+            if isinstance(call, dict)
+        ]
+        logging.getLogger(__name__).info(
+            "agent_loop_debug route=tools tool_count=%d names=%s",
+            len(last.tool_calls),
+            tool_names,
+        )
         return "tools"
+    logging.getLogger(__name__).info("agent_loop_debug route=end")
     return END
 
 
