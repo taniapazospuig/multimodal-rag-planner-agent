@@ -541,7 +541,7 @@ def _log_missing_required_tool_args(tool_calls: Any) -> None:
                 )
             continue
 
-        if name == "recommend_study_environment":
+        if name in {"recommend_study_environment", "assess_study_environment_fit"}:
             task_query = str(args.get("task_query", "")).strip()
             query = str(args.get("query", "")).strip()
             if not task_query and not query:
@@ -1408,20 +1408,41 @@ def _query_study_environment_image_scores(query: str, top_k: int) -> dict[str, f
     return image_scores
 
 
-@tool
-def recommend_study_environment(
+def _resolve_environment_hint(raw_text: str, env_rows: list[dict[str, Any]]) -> str:
+    """Resolve an environment hint to a known environment_id."""
+    normalized_text = _normalize_for_match(raw_text)
+    if not normalized_text:
+        return ""
+    for row in env_rows:
+        env_id = str(row.get("environment_id", "")).strip()
+        env_type = str(row.get("environment_type", "")).strip().lower()
+        coarse_geo = str(row.get("coarse_geo", "")).strip().lower()
+        env_id_norm = _normalize_for_match(env_id)
+        env_type_norm = _normalize_for_match(env_type.replace("_", " "))
+        coarse_geo_norm = _normalize_for_match(coarse_geo.replace("_", " "))
+        if env_id_norm and _term_in_query(env_id_norm, normalized_text):
+            return env_id
+        if env_type_norm and _term_in_query(env_type_norm, normalized_text):
+            return env_id
+        if coarse_geo_norm and _term_in_query(coarse_geo_norm, normalized_text):
+            return env_id
+    return ""
+
+
+def _run_study_environment_tool(
+    *,
+    mode: str,
     task_query: str = "",
     query: str = "",
+    environment_hint: str = "",
     top_k: int = 4,
 ) -> str:
     """
-    C4 environment recommender: choose where a task should be done.
-
-    Ablation behavior:
-    - text_only: uses study_environments.jsonl + indexed text retrieval for study-location photos.
-    - multimodal_retrieval_mllm: additionally scores original study-location photos from planner_images.
+    Shared C4 helper used by recommendation and targeted assessment tools.
     """
-    normalized_query = task_query.strip() or query.strip()
+    targeted_mode = mode == "assess"
+    raw_query = query.strip() or task_query.strip()
+    normalized_query = raw_query
     if not normalized_query:
         return "C4_STUDY_ENVIRONMENT:\nquery field was missing."
     env_rows = get_study_environment_rows()
@@ -1482,19 +1503,38 @@ def recommend_study_environment(
     if not candidates:
         return "C4_STUDY_ENVIRONMENT:\nNo candidate environments found."
 
+    targeted_environment_id = (
+        _resolve_environment_hint(environment_hint or raw_query, env_rows) if targeted_mode else ""
+    )
+    if targeted_mode and not targeted_environment_id:
+        return (
+            "C4_STUDY_ENVIRONMENT:\n"
+            "Could not resolve the requested environment. "
+            "Provide environment_hint using environment_id or environment_type."
+        )
+    image_grounding_guidance = (
+        "When evidence_mode is multimodal_index+images, explicitly ground your reasoning in observable "
+        "image characteristics (for example: visible natural light, crowd density, desk/chair setup, "
+        "indoor vs outdoor context, and distraction cues).\n"
+        if multimodal_on
+        else ""
+    )
     llm_candidates = candidates[: max(3, min(8, int(top_k) * 2))]
     llm_prompt = [
         SystemMessage(
             content=(
-                "You are selecting one best study environment for a task.\n"
+                "You are analyzing study-environment suitability for a task.\n"
                 "You only have sparse metadata (environment_type/coarse_geo) plus retrieval evidence.\n"
                 "Infer likely task fit factors (internet connection, natural light, interruptions, "
                 "noise, seating comfort) from available evidence. In multimodal mode, use image evidence when present.\n"
+                f"{image_grounding_guidance}"
                 "Return strict JSON only with keys:\n"
                 "- environment_id (must be one of the candidates)\n"
+                "- verdict (yes|maybe|no)\n"
                 "- confidence (high|medium|low)\n"
                 "- short_justification (1 sentence)\n"
                 "- factor_rationale (array of 2-4 short bullet strings)\n"
+                "- observable_image_evidence (array of 1-3 short bullet strings; empty array in text-only mode)\n"
                 "Do not call tools."
             )
         ),
@@ -1502,6 +1542,8 @@ def recommend_study_environment(
             content=(
                 f"task_query={normalized_query}\n"
                 f"rag_mode={settings.rag_mode.value}\n"
+                f"mode={mode}\n"
+                f"target_environment_id={targeted_environment_id or 'none'}\n"
                 f"evidence_mode={'multimodal_index+images' if multimodal_on else 'text_index_only'}\n"
                 f"candidates_json={json.dumps(llm_candidates, ensure_ascii=True)}"
             )
@@ -1514,16 +1556,34 @@ def recommend_study_environment(
         (candidate for candidate in candidates if str(candidate.get("environment_id", "")) == selected_environment_id),
         candidates[0],
     )
+    if targeted_mode:
+        selected = next(
+            (
+                candidate
+                for candidate in candidates
+                if str(candidate.get("environment_id", "")) == targeted_environment_id
+            ),
+            selected,
+        )
     factor_rationale = parsed_selection.get("factor_rationale", [])
     rationale_items = [
         str(item).strip()
         for item in (factor_rationale if isinstance(factor_rationale, list) else [])
         if str(item).strip()
     ][:4]
+    image_evidence = parsed_selection.get("observable_image_evidence", [])
+    image_evidence_items = [
+        str(item).strip()
+        for item in (image_evidence if isinstance(image_evidence, list) else [])
+        if str(item).strip()
+    ][:3]
     short_justification = str(parsed_selection.get("short_justification", "")).strip()
     confidence = str(parsed_selection.get("confidence", "")).strip().lower()
     if confidence not in {"high", "medium", "low"}:
         confidence = "medium"
+    verdict = str(parsed_selection.get("verdict", "")).strip().lower()
+    if verdict not in {"yes", "maybe", "no"}:
+        verdict = "maybe" if targeted_mode else "yes"
     recommendation = {
         "environment_id": selected.get("environment_id", ""),
         "environment_type": selected.get("environment_type", ""),
@@ -1532,6 +1592,9 @@ def recommend_study_environment(
         "justification": short_justification
         or "Chosen by LLM based on factor fit and available retrieval evidence.",
         "factor_rationale": rationale_items,
+        "observable_image_evidence": image_evidence_items if multimodal_on else [],
+        "verdict": verdict,
+        "assessment_mode": "targeted" if targeted_mode else "recommendation",
         "confidence": confidence,
     }
 
@@ -1542,6 +1605,9 @@ def recommend_study_environment(
             f"evidence_mode={'multimodal_index+images' if multimodal_on else 'text_index_only'} | top_k={max(1, int(top_k))}"
         ),
         f"query={normalized_query}",
+        f"ASSESSMENT_MODE={'targeted' if targeted_mode else 'recommendation'}",
+        f"TARGET_ENVIRONMENT_ID={targeted_environment_id or ''}",
+        f"MULTIMODAL_IMAGE_GROUNDING_REQUIRED={1 if multimodal_on else 0}",
         "Top candidates:",
     ]
     for rank, candidate in enumerate(candidates[: max(1, int(top_k))], start=1):
@@ -1575,7 +1641,56 @@ def recommend_study_environment(
     return "\n".join(lines)
 
 
-TOOLS = [kb_course_retrieval, estimate_study_duration, find_free_slots, recommend_study_environment]
+@tool
+def recommend_study_environment(
+    task_query: str = "",
+    query: str = "",
+    top_k: int = 4,
+) -> str:
+    """
+    C4a environment recommender: choose where a task should be done.
+
+    Ablation behavior:
+    - text_only: uses study_environments.jsonl + indexed text retrieval for study-location photos.
+    - multimodal_retrieval_mllm: additionally uses original study-location photo evidence from planner_images.
+    """
+    return _run_study_environment_tool(
+        mode="recommend",
+        task_query=task_query,
+        query=query,
+        top_k=top_k,
+    )
+
+
+@tool
+def assess_study_environment_fit(
+    task_query: str = "",
+    query: str = "",
+    environment_hint: str = "",
+    top_k: int = 4,
+) -> str:
+    """
+    C4b targeted assessment: judge whether a specific environment is good for the task.
+
+    Example prompt:
+    - "Is it a good idea to do this task in common study space?"
+    """
+    return _run_study_environment_tool(
+        mode="assess",
+        task_query=task_query,
+        query=query,
+        environment_hint=environment_hint,
+        top_k=top_k,
+    )
+
+
+TOOLS = [
+    kb_course_retrieval,
+    estimate_study_duration,
+    find_free_slots,
+    recommend_study_environment,
+    assess_study_environment_fit,
+]
 
 
 SYSTEM_PROMPT = SystemMessage(
@@ -1584,13 +1699,15 @@ SYSTEM_PROMPT = SystemMessage(
         "C1 TopicSummary: summarize topics studied in a course/week using kb_course_retrieval.\n"
         "C2 DurationEstimator: estimate how many minutes a course-related task should take.\n"
         "C3 FreeSlotFinder: find open schedule slots in a target week/day given required_minutes.\n"
-        "C4 StudyEnvironmentRecommender: recommend the best study environment for a specific task using recommend_study_environment.\n"
+        "C4 StudyEnvironment: use recommend_study_environment to choose where to work, "
+        "or assess_study_environment_fit to judge a specific environment.\n"
         "Respect dataset week tags like week-01..week-07 and easter-week.\n"
         "Routing rules:\n"
         "- If user asks to estimate time/effort/duration, call estimate_study_duration first.\n"
         "- If user asks to summarize topics/content, call kb_course_retrieval first.\n"
         "- If user asks for scheduling availability, call find_free_slots first.\n"
         "- If user asks where to do a task or asks for best study place/environment, call recommend_study_environment first.\n"
+        "- If user asks 'Is it a good idea to do this task in [environment]?', call assess_study_environment_fit first and preserve the environment mention in environment_hint.\n"
         "Always include required tool arguments."
     )
 )
@@ -1769,10 +1886,12 @@ def agent_node(state: AgentState):
                 ),
                 HumanMessage(content=c3_payload),
             ]
-        elif tool_name == "recommend_study_environment":
+        elif tool_name in {"recommend_study_environment", "assess_study_environment_fit"}:
+            targeted_mode = tool_name == "assess_study_environment_fit"
+            require_image_grounding = "MULTIMODAL_IMAGE_GROUNDING_REQUIRED=1" in tool_result
             c4_payload_text = (
                 f'User request: "{user_query}"\n\n'
-                "Environment recommendation evidence:\n"
+                "Environment analysis evidence:\n"
                 f"{tool_result}"
             )
             image_paths = _extract_image_paths(tool_result)
@@ -1799,13 +1918,32 @@ def agent_node(state: AgentState):
             prompt_messages = non_tool_messages + [
                 SystemMessage(
                     content=(
-                        "Produce a concise C4 environment recommendation answer.\n"
-                        "Select exactly one environment from the evidence.\n"
-                        "Output format:\n"
-                        "- Recommended environment: environment_id and a short label\n"
-                        "- Why it fits: 1-2 short bullets grounded in factors "
-                        "(internet connection, natural light, interruptions, noise, seating comfort)\n"
-                        "- Optional caveat if confidence is not high."
+                        "Produce a concise C4 environment answer.\n"
+                        + (
+                            "If assessment_mode is targeted, answer whether that specific environment is a good idea "
+                            "for the task (yes/maybe/no) and explain why using environment characteristics.\n"
+                            "Output format:\n"
+                            "- Verdict for requested environment: natural language only.\n"
+                            "  Use internal verdict signals but phrase naturally; do not print raw labels yes/maybe/no.\n"
+                            "- Why: 1-2 short bullets grounded in factors "
+                            "(internet connection, natural light, interruptions, noise, seating comfort)\n"
+                            "- Optional caveat if confidence is not high."
+                            if targeted_mode
+                            else
+                            "If assessment_mode is recommendation, select exactly one environment from the evidence.\n"
+                            "Output format:\n"
+                            "- Recommended environment: environment_id and a short label\n"
+                            "- Why it fits: 1-2 short bullets grounded in factors "
+                            "(internet connection, natural light, interruptions, noise, seating comfort)\n"
+                            "- Optional caveat if confidence is not high."
+                        )
+                        + (
+                            "\nWhen multimodal image grounding is required, include at least one explicit observation "
+                            "from visible image characteristics (for example light level, visible crowd/noise cues, "
+                            "desk/chair ergonomics, indoor/outdoor exposure) and tie it to the verdict."
+                            if require_image_grounding
+                            else ""
+                        )
                     )
                 ),
                 HumanMessage(content=c4_user_payload),
