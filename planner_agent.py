@@ -1,10 +1,11 @@
 """
-Minimal planner agent with five capability labels:
-- C1 TopicSummary (topics studied in course/week from retrieved evidence)
+Minimal planner agent with six capability labels:
+- C1 CourseQA / TopicSummary (course materials only, via kb_course_retrieval)
 - C2 DurationEstimator (estimate study time for a course-related task)
 - C3 FreeSlotFinder (find open slots in a target week/day)
 - C4 StudyEnvironmentRecommender (suggest where to do a task)
 - C5 StudyEnvironmentFit (judge a specific environment for a task)
+- C6 ResearchQA (docs tagged ``evidence`` only, via kb_external_research_retrieval)
 
 This module intentionally reuses already-built retrieval artifacts:
 - Chroma DB in `chroma_db` (dense index)
@@ -24,7 +25,7 @@ import warnings
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, List, TypedDict
+from typing import Any, Callable, List, TypedDict
 
 import chromadb
 import open_clip
@@ -104,6 +105,97 @@ def get_document_rows() -> list[dict[str, str]]:
     return _DOCUMENT_ROWS
 
 
+KB_TAG_COURSE_CONTENT = "course-content"
+KB_TAG_EVIDENCE = "evidence"
+
+
+_DOC_IDS_BY_TAG_CACHE: dict[str, frozenset[str]] = {}
+
+
+def get_doc_ids_with_tag(tags_value: str) -> frozenset[str]:
+    """Return ``doc_id`` values from ``documents.csv`` whose ``tags`` column equals this value."""
+    normalized = tags_value.strip().lower()
+    if not normalized:
+        return frozenset()
+    cached = _DOC_IDS_BY_TAG_CACHE.get(normalized)
+    if cached is not None:
+        return cached
+    matched: set[str] = set()
+    for row in get_document_rows():
+        if str(row.get("tags", "")).strip().lower() != normalized:
+            continue
+        doc_id = str(row.get("doc_id", "")).strip()
+        if doc_id:
+            matched.add(doc_id)
+    frozen = frozenset(matched)
+    _DOC_IDS_BY_TAG_CACHE[normalized] = frozen
+    return frozen
+
+
+def get_external_paper_rows() -> list[dict[str, str]]:
+    """Return cached external-paper catalog rows (themes, paths)."""
+    global _EXTERNAL_PAPER_ROWS
+    if _EXTERNAL_PAPER_ROWS is None:
+        _EXTERNAL_PAPER_ROWS = _load_csv_rows(EXTERNAL_PAPERS_CSV_PATH)
+    return _EXTERNAL_PAPER_ROWS
+
+
+def _paper_id_to_doc_id_map() -> dict[str, str]:
+    """Map catalog paper_id (e.g. extp_001) to chunk doc_id using aligned source paths."""
+    global _PAPER_ID_TO_DOC_ID
+    if _PAPER_ID_TO_DOC_ID is not None:
+        return _PAPER_ID_TO_DOC_ID
+
+    doc_by_path: dict[str, str] = {}
+    for row in get_document_rows():
+        if str(row.get("resource_type", "")).strip() != EXTERNAL_PAPER_RESOURCE_TYPE:
+            continue
+        path_key = str(row.get("source_path", "")).strip().replace("\\", "/")
+        if path_key:
+            doc_by_path[path_key] = str(row.get("doc_id", "")).strip()
+
+    mapping: dict[str, str] = {}
+    for paper in get_external_paper_rows():
+        pid = str(paper.get("paper_id", "")).strip()
+        fp = str(paper.get("file_path", "")).strip().replace("\\", "/")
+        if pid and fp and fp in doc_by_path:
+            mapping[pid] = doc_by_path[fp]
+
+    _PAPER_ID_TO_DOC_ID = mapping
+    return mapping
+
+
+def _external_doc_ids_matching_theme(hint: str) -> frozenset[str]:
+    """Return doc_ids whose catalog row matches theme/title against the hint."""
+    normalized = _normalize_for_match(hint)
+    if not normalized:
+        return frozenset()
+    pmap = _paper_id_to_doc_id_map()
+    out: set[str] = set()
+    for paper in get_external_paper_rows():
+        blob = _normalize_for_match(
+            " ".join(
+                [
+                    str(paper.get("theme_primary", "")),
+                    str(paper.get("theme_secondary", "")),
+                    str(paper.get("title_short", "")),
+                ]
+            )
+        )
+        if not blob:
+            continue
+        hinted_tokens = [w for w in normalized.split() if len(w) > 2]
+        token_match = bool(hinted_tokens) and all(t in blob for t in hinted_tokens)
+        substring_match = normalized in blob or blob in normalized
+        if not (substring_match or token_match):
+            continue
+        pid = str(paper.get("paper_id", "")).strip()
+        doc_id = pmap.get(pid, "")
+        if doc_id:
+            out.add(doc_id)
+    return frozenset(out)
+
+
 def get_study_environment_rows() -> list[dict[str, Any]]:
     """Return cached study-environment metadata rows."""
     global _STUDY_ENVIRONMENT_ROWS
@@ -121,10 +213,15 @@ _ESTIMATOR_LLM = None
 _RETRIEVER: "CourseRetriever | None" = None
 _OPENCLIP_BACKBONE: "OpenCLIPBackbone | None" = None
 _DOCUMENT_ROWS: list[dict[str, str]] | None = None
+_EXTERNAL_PAPER_ROWS: list[dict[str, str]] | None = None
+_PAPER_ID_TO_DOC_ID: dict[str, str] | None = None
 _STUDY_ENVIRONMENT_ROWS: list[dict[str, Any]] | None = None
 
 DOCUMENTS_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "documents.csv"
+EXTERNAL_PAPERS_CSV_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "external_papers.csv"
 STUDY_ENVIRONMENTS_JSONL_PATH = _BASE_DIR / "data" / "kb" / "metadata" / "study_environments.jsonl"
+
+EXTERNAL_PAPER_RESOURCE_TYPE = "external_paper"
 
 DAY_TO_ABBR = {
     "monday": "Mon",
@@ -192,6 +289,65 @@ def _normalize_for_match(text: str) -> str:
     normalized = re.sub(r"[^\w\s-]+", " ", normalized)
     normalized = re.sub(r"\s+", " ", normalized)
     return normalized.strip()
+
+
+def _c6_ordered_extp_ids(user_query: str) -> list[str]:
+    """Unique extp_* catalog ids in user text, stable order."""
+    found = re.findall(r"\b(extp_\d+)\b", user_query.lower())
+    return list(dict.fromkeys(found))
+
+
+def _c6_paper_id_to_force(user_query: str) -> str:
+    """If the user names any extp_* id, use the first for kb_external_research_retrieval.paper_id."""
+    ids = _c6_ordered_extp_ids(user_query)
+    return ids[0] if ids else ""
+
+
+def _c6_is_single_paper_user_query(user_query: str) -> bool:
+    """Exactly one distinct extp_* in the user message → single-paper scope for C6 checks."""
+    return len(_c6_ordered_extp_ids(user_query)) == 1
+
+
+def _c6_allowed_source_files(tool_result: str) -> set[str]:
+    return set(re.findall(r"source_file=(\S+)", tool_result))
+
+
+def _c6_bracket_pdf_citations(answer_text: str) -> list[str]:
+    return re.findall(r"\[([^\]\n]+\.pdf)\]", answer_text, flags=re.IGNORECASE)
+
+
+def _c6_final_citations_match_retrieval(answer_text: str, tool_result: str) -> bool:
+    """Every [...pdf] in the answer must exactly match a source_file= from this retrieval blob."""
+    cited = _c6_bracket_pdf_citations(answer_text)
+    if not cited:
+        return True
+    allowed = _c6_allowed_source_files(tool_result)
+    return all(c in allowed for c in cited)
+
+
+def _aimessage_with_forced_c6_paper_id(response: AIMessage, user_query: str) -> AIMessage:
+    forced = _c6_paper_id_to_force(user_query)
+    if not forced:
+        return response
+    tcalls = getattr(response, "tool_calls", None) or []
+    if not tcalls:
+        return response
+    new_calls: list[Any] = []
+    touched = False
+    for tc in tcalls:
+        if not isinstance(tc, dict):
+            new_calls.append(tc)
+            continue
+        if str(tc.get("name", "")).strip() != "kb_external_research_retrieval":
+            new_calls.append(tc)
+            continue
+        args = dict(tc.get("args") or {})
+        args["paper_id"] = forced
+        new_calls.append({**tc, "args": args})
+        touched = True
+    if not touched:
+        return response
+    return response.model_copy(update={"tool_calls": new_calls})
 
 
 def _term_in_query(term: str, normalized_query: str) -> bool:
@@ -493,6 +649,7 @@ def _log_missing_required_tool_args(tool_calls: Any) -> None:
         return
     required_by_tool = {
         "kb_course_retrieval": ("query",),
+        "kb_external_research_retrieval": ("query",),
         "find_free_slots": ("week_filter",),
     }
     for call in tool_calls:
@@ -545,8 +702,10 @@ def _rrf_fuse(dense_ranked_ids: list[str], bm25_ranked_ids: list[str], k: int) -
 
 class CourseRetriever:
     """
-    Unified retrieval over existing indexes for C1/C2/C3.
-    Reads from Chroma `text_chunks`, Chroma `planner_images`, and BM25 JSONL.
+    Unified retrieval over indexed ``text_chunks`` + BM25 (and planner_images fusion where configured).
+    C1 restricts to rows tagged ``course-content`` in ``documents.csv``; C6 to ``evidence``.
+    Other callers omit doc allowlists when searching planner or study-environment corpora.
+
     Text ranking strategy is controlled by TEXT_RETRIEVAL_STRATEGY (hybrid|dense_only).
     RAG_MODE controls whether image retrieval/fusion is applied
     (multimodal_retrieval_mllm only) or text hits are returned directly.
@@ -630,7 +789,14 @@ class CourseRetriever:
         )
         return [str(chunk_id) for chunk_id in ((results.get("ids") or [[]])[0] or [])]
 
-    def _bm25_search(self, query: str, course_filter: str, week_filter: str, n_results: int) -> list[str]:
+    def _bm25_search(
+        self,
+        query: str,
+        course_filter: str,
+        week_filter: str,
+        n_results: int,
+        restrict_doc_ids: frozenset[str] | None = None,
+    ) -> list[str]:
         """Run lexical BM25 retrieval from pre-built corpus rows."""
         if self.bm25 is None or not self.bm25_rows:
             return []
@@ -656,8 +822,46 @@ class CourseRetriever:
                 continue
             if week_filter and str(meta.get("week", "")) != week_filter:
                 continue
+            if restrict_doc_ids is not None:
+                doc = str(meta.get("doc_id", "")).strip()
+                if doc not in restrict_doc_ids:
+                    continue
             output.append(str(row.get("chunk_id", "")))
         return [chunk_id for chunk_id in output if chunk_id]
+
+    def _bm25_search_with_predicate(
+        self,
+        query: str,
+        n_results: int,
+        row_predicate: Callable[[dict[str, Any]], bool],
+    ) -> list[str]:
+        """BM25 retrieval restricted to corpus rows whose metadata passes ``row_predicate``."""
+        if self.bm25 is None or not self.bm25_rows:
+            return []
+
+        tokens = tokenize_for_bm25(query, self.lexical_tokenizer_config)
+        if not tokens:
+            return []
+
+        scores = self.bm25.get_scores(tokens)
+        ranked_indices = sorted(
+            range(len(scores)),
+            key=lambda index: float(scores[index]),
+            reverse=True,
+        )
+
+        output: list[str] = []
+        for index in ranked_indices:
+            if len(output) >= max(1, n_results):
+                break
+            row = self.bm25_rows[index]
+            meta = row.get("metadata", {}) or {}
+            if not row_predicate(meta):
+                continue
+            cid = str(row.get("chunk_id", "")).strip()
+            if cid:
+                output.append(cid)
+        return output
 
     def _hydrate_hit(self, chunk_id: str, score: float) -> dict[str, Any]:
         """Materialize a fused hit from BM25 rows, or fallback to Chroma documents."""
@@ -802,21 +1006,40 @@ class CourseRetriever:
         *,
         strategy_override: TextRetrievalStrategy | None = None,
         enable_multimodal_fusion: bool | None = None,
+        restrict_doc_ids: frozenset[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Run configured retrieval strategy with optional course/week filters."""
+        """Run configured retrieval strategy with optional course/week filters.
+
+        When ``restrict_doc_ids`` is set (e.g. C1 CourseQA), fused hits are limited to chunks whose
+        ``doc_id`` is in ``documents.csv`` with that cohort (typically ``course-content`` tags).
+        """
+        if restrict_doc_ids is not None and len(restrict_doc_ids) == 0:
+            return []
+
         use_meta = self.settings.retrieval_metadata_filter_enabled
         eff_course = course_filter if use_meta else ""
         eff_week = week_filter if use_meta else ""
         where = self._make_where(course_filter=eff_course, week_filter=eff_week)
+
+        dense_where: dict[str, Any] | None = where
+        if restrict_doc_ids is not None:
+            doc_clause = {"doc_id": {"$in": sorted(restrict_doc_ids)}}
+            if dense_where is None:
+                dense_where = doc_clause
+            else:
+                dense_where = {"$and": [dense_where, doc_clause]}
+
         strategy = strategy_override or self.settings.text_retrieval_strategy
         _trace_log(
-            "retrieval.search query=%r top_k=%d strategy=%s use_meta=%s eff_course=%r eff_week=%r where=%s",
+            "retrieval.search query=%r top_k=%d strategy=%s use_meta=%s eff_course=%r eff_week=%r "
+            "restrict_doc_ids=%s where=%s",
             query,
             max(1, int(top_k)),
             strategy.value,
             use_meta,
             eff_course,
             eff_week,
+            None if restrict_doc_ids is None else len(restrict_doc_ids),
             where if where is not None else "none",
         )
         dense_ids: list[str] = []
@@ -824,17 +1047,26 @@ class CourseRetriever:
         fused_scores: dict[str, float] = {}
 
         if strategy == TextRetrievalStrategy.DENSE_ONLY:
-            dense_ids = self._dense_search(query, where=where, n_results=max(top_k, self.settings.dense_k))
+            dense_ids = self._dense_search(
+                query,
+                where=dense_where,
+                n_results=max(top_k, self.settings.dense_k),
+            )
             _trace_log("retrieval.candidates dense_only count=%d dense_head=%s", len(dense_ids), dense_ids[:3])
             for rank, chunk_id in enumerate(dense_ids, start=1):
                 fused_scores[chunk_id] = 1.0 / float(rank)
         else:
-            dense_ids = self._dense_search(query, where=where, n_results=max(top_k, self.settings.dense_k))
+            dense_ids = self._dense_search(
+                query,
+                where=dense_where,
+                n_results=max(top_k, self.settings.dense_k),
+            )
             bm25_ids = self._bm25_search(
                 query=query,
                 course_filter=eff_course,
                 week_filter=eff_week,
                 n_results=max(top_k, self.settings.bm25_k),
+                restrict_doc_ids=restrict_doc_ids,
             )
             _trace_log(
                 "retrieval.candidates hybrid dense=%d bm25=%d dense_head=%s bm25_head=%s",
@@ -845,9 +1077,152 @@ class CourseRetriever:
             )
             fused_scores = _rrf_fuse(dense_ids, bm25_ids, k=max(1, self.settings.rrf_k))
 
-        ranked_ids = sorted(fused_scores.keys(), key=lambda chunk_id: fused_scores[chunk_id], reverse=True)[: max(1, top_k)]
-        _trace_log("retrieval.ranked strategy=%s count=%d head=%s", strategy.value, len(ranked_ids), ranked_ids[:3])
-        text_hits = [self._hydrate_hit(chunk_id, score=fused_scores.get(chunk_id, 0.0)) for chunk_id in ranked_ids]
+        ranked_all = sorted(
+            fused_scores.keys(),
+            key=lambda chunk_id: fused_scores[chunk_id],
+            reverse=True,
+        )
+        text_hits: list[dict[str, Any]] = []
+        for chunk_id in ranked_all:
+            if len(text_hits) >= max(1, top_k):
+                break
+            hit = self._hydrate_hit(chunk_id, score=fused_scores.get(chunk_id, 0.0))
+            if restrict_doc_ids is not None:
+                meta = hit.get("metadata", {}) or {}
+                doc = str(meta.get("doc_id", "")).strip()
+                if doc not in restrict_doc_ids:
+                    continue
+            text_hits.append(hit)
+        _trace_log(
+            "retrieval.ranked strategy=%s kept=%s head_chunk_ids=%s",
+            strategy.value,
+            len(text_hits),
+            [h.get("chunk_id") for h in text_hits[:3]],
+        )
+
+        multimodal_enabled = (
+            self.settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM
+            if enable_multimodal_fusion is None
+            else bool(enable_multimodal_fusion)
+        )
+        if not multimodal_enabled:
+            return text_hits
+
+        image_where: dict[str, Any] | None = where
+        if restrict_doc_ids is not None:
+            doc_clause = {"doc_id": {"$in": sorted(restrict_doc_ids)}}
+            if image_where is None:
+                image_where = doc_clause
+            else:
+                image_where = {"$and": [image_where, doc_clause]}
+
+        image_scores = self._image_search(
+            query=query,
+            where=image_where,
+            n_results=max(top_k, self.settings.multimodal_fusion_k),
+        )
+        multimodal_hits = self._multimodal_fuse_scores(text_hits=text_hits, image_scores=image_scores)
+        _trace_log("retrieval.multimodal final_hits=%d", len(multimodal_hits))
+        return multimodal_hits[: max(1, top_k)]
+
+    def search_external_knowledge(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        allowed_doc_ids: frozenset[str] | None = None,
+        strategy_override: TextRetrievalStrategy | None = None,
+        enable_multimodal_fusion: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Retrieval over KB chunks whose ``documents.csv`` ``tags`` value is ``evidence`` (C6 Research QA).
+
+        ``allowed_doc_ids`` further narrows to a subset when non-``None`` (intersected with evidence docs).
+        """
+        if allowed_doc_ids is not None and len(allowed_doc_ids) == 0:
+            return []
+
+        evidence_docs = get_doc_ids_with_tag(KB_TAG_EVIDENCE)
+        if not evidence_docs:
+            return []
+
+        restrict_docs: frozenset[str] | None
+        if allowed_doc_ids is not None:
+            restrict_docs = frozenset(doc for doc in allowed_doc_ids if doc in evidence_docs)
+            if not restrict_docs:
+                return []
+            dense_where_ids = sorted(restrict_docs)
+        else:
+            restrict_docs = None
+            dense_where_ids = sorted(evidence_docs)
+
+        ext_where: dict[str, Any] = {"doc_id": {"$in": dense_where_ids}}
+
+        def row_ok(meta: dict[str, Any]) -> bool:
+            doc_id = str(meta.get("doc_id", "")).strip()
+            if doc_id not in evidence_docs:
+                return False
+            if restrict_docs is not None and doc_id not in restrict_docs:
+                return False
+            return True
+
+        strategy = strategy_override or self.settings.text_retrieval_strategy
+        fused_scores: dict[str, float] = {}
+        dense_ids: list[str] = []
+        bm25_ids: list[str] = []
+
+        if strategy == TextRetrievalStrategy.DENSE_ONLY:
+            dense_ids = self._dense_search(
+                query, where=ext_where, n_results=max(top_k, self.settings.dense_k)
+            )
+            _trace_log(
+                "retrieval.external dense_only count=%d dense_head=%s",
+                len(dense_ids),
+                dense_ids[:3],
+            )
+            for rank, chunk_id in enumerate(dense_ids, start=1):
+                fused_scores[chunk_id] = 1.0 / float(rank)
+        else:
+            dense_ids = self._dense_search(
+                query, where=ext_where, n_results=max(top_k, self.settings.dense_k)
+            )
+            bm25_ids = self._bm25_search_with_predicate(
+                query=query,
+                n_results=max(top_k, self.settings.bm25_k),
+                row_predicate=row_ok,
+            )
+            _trace_log(
+                "retrieval.external hybrid dense=%d bm25=%d dense_head=%s bm25_head=%s",
+                len(dense_ids),
+                len(bm25_ids),
+                dense_ids[:3],
+                bm25_ids[:3],
+            )
+            fused_scores = _rrf_fuse(dense_ids, bm25_ids, k=max(1, self.settings.rrf_k))
+
+        ranked_all = sorted(
+            fused_scores.keys(),
+            key=lambda chunk_id: fused_scores[chunk_id],
+            reverse=True,
+        )
+        text_hits: list[dict[str, Any]] = []
+        for chunk_id in ranked_all:
+            if len(text_hits) >= max(1, top_k):
+                break
+            hit = self._hydrate_hit(chunk_id, score=fused_scores.get(chunk_id, 0.0))
+            meta = hit.get("metadata", {}) or {}
+            doc_h = str(meta.get("doc_id", "")).strip()
+            if doc_h not in evidence_docs:
+                continue
+            if restrict_docs is not None and doc_h not in restrict_docs:
+                continue
+            text_hits.append(hit)
+        _trace_log(
+            "retrieval.external ranked count=%d kept=%s head_hit_ids=%s",
+            len(ranked_all),
+            len(text_hits),
+            [h.get("chunk_id") for h in text_hits[:3]],
+        )
 
         multimodal_enabled = (
             self.settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM
@@ -859,16 +1234,16 @@ class CourseRetriever:
 
         image_scores = self._image_search(
             query=query,
-            where=where,
+            where=ext_where,
             n_results=max(top_k, self.settings.multimodal_fusion_k),
         )
         multimodal_hits = self._multimodal_fuse_scores(text_hits=text_hits, image_scores=image_scores)
-        _trace_log("retrieval.multimodal final_hits=%d", len(multimodal_hits))
+        _trace_log("retrieval.external.multimodal final_hits=%d", len(multimodal_hits))
         return multimodal_hits[: max(1, top_k)]
 
 
 def get_retriever() -> CourseRetriever:
-    """Return singleton C1 retriever."""
+    """Return singleton text/multimodal retriever (course + external KB)."""
     global _RETRIEVER
     if _RETRIEVER is None:
         _RETRIEVER = CourseRetriever(get_settings())
@@ -883,7 +1258,7 @@ def kb_course_retrieval(
     week_filter: str = "",
 ) -> str:
     """
-    C1a Retrieval (internal): return grounded snippets for course/week/topic.
+    C1 CourseQA retrieval (internal): grounded snippets limited to KB documents tagged ``course-content``.
 
     Args:
         query: User query/topic to retrieve evidence for.
@@ -902,13 +1277,16 @@ def kb_course_retrieval(
     normalized_query = query.strip()
     if not normalized_query:
         return "COURSE_RETRIEVAL_RESULTS:\nquery field was missing."
+    restrict_course_docs = get_doc_ids_with_tag(KB_TAG_COURSE_CONTENT)
     _trace_log(
-        "c1.kb_course_retrieval query=%r tool_course=%r tool_week=%r resolved_course=%r resolved_week=%r",
+        "c1.kb_course_retrieval query=%r tool_course=%r tool_week=%r resolved_course=%r resolved_week=%r "
+        "course_content_doc_scope=%s",
         normalized_query,
         course_filter,
         week_filter,
         resolved_course,
         resolved_week,
+        len(restrict_course_docs),
     )
 
     # resolved_* are always computed for the tool transcript; only applied inside
@@ -918,6 +1296,7 @@ def kb_course_retrieval(
         top_k=max(1, int(top_k)),
         course_filter=resolved_course,
         week_filter=resolved_week,
+        restrict_doc_ids=restrict_course_docs,
     )
     _trace_log("c1.retrieval hits=%d", len(hits))
 
@@ -929,6 +1308,7 @@ def kb_course_retrieval(
     lines.append(
         f"Applied filters -> metadata_filter={'on' if meta_on else 'off'}"
         f" | course={resolved_course or 'none'} | week={resolved_week or 'none'}"
+        f" | corpus_tags={KB_TAG_COURSE_CONTENT}"
         f" | top_k={max(1, int(top_k))}"
         f" | rag_mode={settings.rag_mode.value}"
         f" | retrieval_strategy={settings.text_retrieval_strategy.value}"
@@ -952,6 +1332,127 @@ def kb_course_retrieval(
                 f"source_file={source_file} "
                 f"course={metadata.get('course', '?')} "
                 f"week={metadata.get('week', '?')}"
+            )
+        )
+        if "text_score" in hit or "image_score" in hit:
+            lines.append(
+                (
+                    f"   score_breakdown="
+                    f"text:{float(hit.get('text_score', 0.0)):.5f} "
+                    f"image:{float(hit.get('image_score', 0.0)):.5f}"
+                )
+            )
+        if page_image_abs:
+            lines.append(f"   page_image={page_image_abs}")
+        lines.append(f"   snippet={snippet}")
+    if image_paths:
+        unique_image_paths = list(dict.fromkeys(image_paths))
+        lines.append(f"IMAGE_PATHS_JSON={json.dumps(unique_image_paths)}")
+    return "\n".join(lines)
+
+
+@tool
+def kb_external_research_retrieval(
+    query: str,
+    top_k: int = 6,
+    paper_id: str = "",
+    theme_hint: str = "",
+) -> str:
+    """
+    C6 Research QA (internal): grounded snippets from ``documents.csv`` rows tagged ``evidence`` only.
+
+    Use for evidence on task prioritization, study techniques and learning science,
+    cognitive load / energy scheduling, breaks and recovery, habit formation, etc.
+
+    Args:
+        query: Research question or concepts to retrieve (required).
+        top_k: Number of evidence snippets to return.
+        paper_id: Optional catalog id from ``external_papers.csv`` (e.g. extp_004).
+        theme_hint: Optional substring to bias toward themes in the catalog (e.g. spaced repetition, habits).
+    """
+    settings = get_settings()
+    normalized_query = query.strip()
+    if not normalized_query:
+        return "C6_RESEARCH_QA_RETRIEVAL_RESULTS:\nquery field was missing."
+
+    catalog_note = ""
+    allow: frozenset[str] | None = None
+
+    pid = str(paper_id).strip().lower()
+    if pid:
+        doc_for_paper = _paper_id_to_doc_id_map().get(pid, "")
+        if not doc_for_paper:
+            return (
+                "C6_RESEARCH_QA_RETRIEVAL_RESULTS:\nUnknown paper_id. "
+                "Use ids from external_papers.csv (e.g. extp_001)."
+            )
+        allow = frozenset({doc_for_paper})
+
+    th = str(theme_hint).strip()
+    if th:
+        theme_docs = _external_doc_ids_matching_theme(th)
+        if theme_docs:
+            if allow is not None:
+                inter = frozenset(doc for doc in allow if doc in theme_docs)
+                if not inter:
+                    return (
+                        "C6_RESEARCH_QA_RETRIEVAL_RESULTS:\npaper_id does not match "
+                        "theme_hint according to external_papers.csv; broaden or drop one filter."
+                    )
+                allow = inter
+            else:
+                allow = theme_docs
+        else:
+            catalog_note = (
+                "Catalog note: theme_hint matched no rows in external_papers.csv; searched all evidence-tagged documents."
+            )
+
+    _trace_log(
+        "c6.kb_external_research_retrieval query=%r paper_id=%r theme_hint=%r allow=%s",
+        normalized_query,
+        paper_id,
+        theme_hint,
+        None if allow is None else sorted(allow),
+    )
+
+    hits = get_retriever().search_external_knowledge(
+        query=normalized_query,
+        top_k=max(1, int(top_k)),
+        allowed_doc_ids=allow,
+    )
+    _trace_log("c6.retrieval hits=%d", len(hits))
+
+    if not hits:
+        return "C6_RESEARCH_QA_RETRIEVAL_RESULTS:\nNo grounded snippets found for evidence-tagged documents with current filters."
+
+    lines: list[str] = ["C6_RESEARCH_QA_RETRIEVAL_RESULTS:"]
+    if catalog_note:
+        lines.append(catalog_note)
+    lines.append(
+        f"Applied scope -> corpus_tags={KB_TAG_EVIDENCE}"
+        f" | paper_id_filter={pid or 'none'} | theme_hint={th or 'none'}"
+        f" | top_k={max(1, int(top_k))}"
+        f" | rag_mode={settings.rag_mode.value}"
+        f" | retrieval_strategy={settings.text_retrieval_strategy.value}"
+    )
+    image_paths: list[str] = []
+    for rank, hit in enumerate(hits, start=1):
+        metadata = hit.get("metadata", {}) or {}
+        source_path = str(metadata.get("source_path", "?"))
+        source_file = Path(source_path).name if source_path and source_path != "?" else "unknown-source"
+        page_image_path = str(metadata.get("page_image_path", "")).strip()
+        page_image_abs = str((_BASE_DIR / page_image_path).resolve()) if page_image_path else ""
+        if page_image_abs and Path(page_image_abs).exists():
+            image_paths.append(page_image_abs)
+        snippet = str(hit.get("text", "")).replace("\n", " ").strip()
+        snippet = re.sub(r"\[[^\]]+\]\s*", "", snippet).strip()
+        if len(snippet) > 260:
+            snippet = snippet[:260].rstrip() + "..."
+        lines.append(
+            (
+                f"{rank}. score={float(hit.get('score', 0.0)):.5f} "
+                f"source_file={source_file} "
+                f"doc_id={metadata.get('doc_id', '?')}"
             )
         )
         if "text_score" in hit or "image_score" in hit:
@@ -1085,6 +1586,7 @@ def _estimate_study_duration_mode(
         top_k=max(3, min(8, int(settings.hybrid_k))),
         course_filter=resolved_course,
         week_filter=resolved_week,
+        restrict_doc_ids=get_doc_ids_with_tag(KB_TAG_COURSE_CONTENT),
     )
     logger.info(
         "c2_debug retrieval_hits count=%d top_k=%d",
@@ -1979,6 +2481,7 @@ def assess_study_environment_fit(
 
 TOOLS = [
     kb_course_retrieval,
+    kb_external_research_retrieval,
     estimate_study_duration,
     find_free_slots,
     recommend_study_environment,
@@ -1988,8 +2491,13 @@ TOOLS = [
 
 SYSTEM_PROMPT = SystemMessage(
     content=(
-        "You are a study planner assistant with five capability labels C1–C5.\n"
-        "C1 TopicSummary: summarize topics studied in a course/week using kb_course_retrieval.\n"
+        "You are a study planner assistant with six capability labels C1–C5 and C6.\n"
+        "C1 CourseQA / TopicSummary: summarize course/week material using kb_course_retrieval "
+        "(only docs tagged ``course-content`` in ``documents.csv``—never syllabus-unrelated KB).\n"
+        "C6 ResearchQA: answer from indexed research using kb_external_research_retrieval "
+        "(only docs tagged ``evidence``: task prioritization, study techniques, cognitive load "
+        "and scheduling energy, breaks and recovery, habit formation, behavior change). Optionally set "
+        "theme_hint from the user wording and paper_id if they name an extp_* catalog id.\n"
         "C2 DurationEstimator: estimate task minutes with estimate_study_duration.\n"
         "C3 FreeSlotFinder: find open schedule slots with find_free_slots.\n"
         "C4 StudyEnvironmentRecommender: use recommend_study_environment to choose where to work.\n"
@@ -1997,7 +2505,9 @@ SYSTEM_PROMPT = SystemMessage(
         "Respect dataset week tags like week-01..week-07 and easter-week.\n"
         "Routing rules:\n"
         "- If user asks to estimate duration, call estimate_study_duration.\n"
-        "- If user asks to summarize topics/content, call kb_course_retrieval first.\n"
+        "- If user asks what was covered / course topics / lecture content, call kb_course_retrieval first (C1).\n"
+        "- If user asks about research-backed study advice, prioritization psychology, spaced practice, recall, habits, breaks, fatigue, routines, "
+        "or similar—not specific course syllabus content—call kb_external_research_retrieval first (C6).\n"
         "- If user asks for free slots, call find_free_slots.\n"
         "- If user asks where to do a task or asks for best study place/environment, call recommend_study_environment first (C4).\n"
         "- If user asks 'Is it a good idea to do this task in [environment]?', call assess_study_environment_fit first (C5) "
@@ -2144,6 +2654,37 @@ def _get_planner_memory(state: AgentState) -> dict[str, Any]:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
+def _format_planner_memory_for_prompt(mem: dict[str, Any]) -> str:
+    """Compact system text so the model can reuse resolved scope across steps and REPL turns."""
+    if not mem:
+        return ""
+    lines: list[str] = []
+    cap = str(mem.get("capability", "")).strip().upper()
+    if cap:
+        lines.append(f"Last planner capability: {cap}")
+    course = str(mem.get("resolved_course", "")).strip()
+    week = str(mem.get("resolved_week", "")).strip()
+    day = str(mem.get("resolved_day", "")).strip()
+    scope: list[str] = []
+    if course:
+        scope.append(f"course={course}")
+    if week:
+        scope.append(f"week={week}")
+    if day:
+        scope.append(f"day={day}")
+    if scope:
+        lines.append("Resolved scope: " + ", ".join(scope))
+    tool = str(mem.get("last_tool_name", "")).strip()
+    if tool:
+        lines.append(f"Last tool: {tool}")
+    if not lines:
+        return ""
+    return (
+        "Planner memory (session continuity; internal context—not a user quotation):\n"
+        + "\n".join(f"- {line}" for line in lines)
+    )
+
+
 def _parse_applied_filters_from_blob(text: str) -> dict[str, str]:
     """Best-effort course/week/day from tool transcript lines (Applied filters -> ...)."""
     course_m = re.search(r"\bcourse=([^\s|]+)", text, re.I)
@@ -2194,6 +2735,7 @@ def _tool_call_args_for_executed_tool(messages: list[BaseMessage], tool_name: st
 
 _CAPABILITY_BY_TOOL: dict[str, str] = {
     "kb_course_retrieval": "c1",
+    "kb_external_research_retrieval": "c6",
     "estimate_study_duration": "c2",
     "find_free_slots": "c3",
     "recommend_study_environment": "c4",
@@ -2296,6 +2838,8 @@ def _tool_output_is_weak(
         "no planner rows matched",
         "no candidate environments found",
         "could not resolve the requested environment",
+        "unknown paper_id",
+        "theme_hint according to external_papers.csv",
     )
     if any(marker in lower for marker in weak_markers):
         return True, "weak_evidence"
@@ -2315,6 +2859,21 @@ def _tool_output_is_weak(
         query_has_scope = bool(_detect_course_filter(user_query)) or _user_has_explicit_week_signal(user_query)
         if no_course_week_filters and not query_has_scope:
             return True, "broad_query_without_scope_filters"
+        return False, ""
+
+    if tool_name == "kb_external_research_retrieval":
+        has_ranked_hits = re.search(r"(?m)^\d+\.\s+score=", text) is not None
+        if "C6_RESEARCH_QA_RETRIEVAL_RESULTS:" not in text or not has_ranked_hits:
+            return True, "missing_retrieval_hits"
+        if _c6_is_single_paper_user_query(user_query):
+            files = re.findall(r"source_file=(\S+)", text)
+            distinct = {f for f in files if f and f != "?"}
+            if len(distinct) > 1:
+                return True, "multi_source_single_paper_scope"
+            expect = _c6_ordered_extp_ids(user_query)[0]
+            got = str((tool_call_args or {}).get("paper_id", "")).strip().lower()
+            if got != expect:
+                return True, "paper_id_mismatch_single_paper"
         return False, ""
 
     if tool_name == "estimate_study_duration":
@@ -2355,12 +2914,27 @@ def _tool_output_is_weak(
     return False, ""
 
 
-def _clarifying_question_for_tool(tool_name: str) -> str:
+def _clarifying_question_for_tool(tool_name: str, reason: str = "") -> str:
     """Short clarification when verification fails (no user-quote; keeps copy generic)."""
     if tool_name == "kb_course_retrieval":
         return (
             "I could not find strong grounded course evidence. "
             "Could you specify the course and week (for example, operations-research, week-03)?"
+        )
+    if tool_name == "kb_external_research_retrieval":
+        if reason == "multi_source_single_paper_scope":
+            return (
+                "Retrieval spanned more than one paper but your message targets a single extp_* paper. "
+                "Try again with one catalog id or broaden the question."
+            )
+        if reason == "paper_id_mismatch_single_paper":
+            return (
+                "The retrieval call did not use the extp_* id from your message. "
+                "Please repeat the question; the agent should scope to that paper only."
+            )
+        return (
+            "I could not find strong snippets among evidence-tagged documents. "
+            "Could you rephrase with more specific keywords (topic or paper_id extp_* if relevant)?"
         )
     if tool_name == "estimate_study_duration":
         return (
@@ -2386,7 +2960,7 @@ def _clarifying_question_for_tool(tool_name: str) -> str:
 
 
 def agent_node(state: AgentState):
-    """LLM node: routes tool calls and composes final C1–C5 responses."""
+    """LLM node: routes tool calls and composes final C1–C6 responses."""
     messages = state["messages"]
     user_query = _latest_user_text(messages)
     _trace_log("agent_node enter last_message_type=%s user_query=%r", getattr(messages[-1], "type", "unknown"), user_query)
@@ -2398,32 +2972,44 @@ def agent_node(state: AgentState):
         _trace_log("agent_node tool_result name=%s preview=%r", tool_name, _truncate_for_log(tool_result, 180))
         lower_tool_result = tool_result.lower()
         missing_kb_query = (
-            tool_name == "kb_course_retrieval"
+            tool_name in {"kb_course_retrieval", "kb_external_research_retrieval"}
             and (
                 "query field was missing" in lower_tool_result
                 or ("field required" in lower_tool_result and "query" in lower_tool_result)
             )
         )
-        kb_no_snippets = tool_name == "kb_course_retrieval" and (
-            "no grounded snippets found" in lower_tool_result
-        )
+        kb_no_snippets = tool_name in {
+            "kb_course_retrieval",
+            "kb_external_research_retrieval",
+        } and ("no grounded snippets found" in lower_tool_result)
         if (missing_kb_query or kb_no_snippets) and user_query.strip():
             logging.getLogger(__name__).warning(
-                "tool_retry kb_course_retrieval -> retrying with latest user query only "
+                "tool_retry %s -> retrying with latest user query only "
                 "(missing_query=%s empty_snippets=%s)",
+                tool_name,
                 bool(missing_kb_query),
                 bool(kb_no_snippets),
             )
             try:
-                _trace_log("agent_node retry kb_course_retrieval with query=%r", user_query.strip())
-                tool_result = str(
-                    kb_course_retrieval.invoke(
-                        {
-                            "query": user_query.strip(),
-                            "top_k": max(1, settings.hybrid_k),
-                        }
+                _trace_log("agent_node retry %s with query=%r", tool_name, user_query.strip())
+                if tool_name == "kb_course_retrieval":
+                    tool_result = str(
+                        kb_course_retrieval.invoke(
+                            {
+                                "query": user_query.strip(),
+                                "top_k": max(1, settings.hybrid_k),
+                            }
+                        )
                     )
-                )
+                else:
+                    payload: dict[str, Any] = {
+                        "query": user_query.strip(),
+                        "top_k": max(1, settings.hybrid_k),
+                    }
+                    fpid = _c6_paper_id_to_force(user_query)
+                    if fpid:
+                        payload["paper_id"] = fpid
+                    tool_result = str(kb_external_research_retrieval.invoke(payload))
             except Exception as exc:
                 logging.getLogger(__name__).warning("tool_retry failed: %s", exc)
 
@@ -2457,7 +3043,8 @@ def agent_node(state: AgentState):
                 SystemMessage(
                     content=(
                         "Produce a concise C3 slot-finder answer.\n"
-                        "Summarize top slot options in bullets and mention if a split is needed."
+                        "Summarize top slot options in bullets and mention if a split is needed.\n"
+                        "Anchor time only on dates/week tag from Free slots; avoid relative week labels unless the user said them."
                     )
                 ),
                 HumanMessage(content=c3_payload),
@@ -2575,22 +3162,39 @@ def agent_node(state: AgentState):
                     "Retrieved evidence:\n"
                     f"{tool_result}"
                 )
+            if tool_name == "kb_external_research_retrieval":
+                retrieval_guide = (
+                    "Summarize actionable, research-grounded guidance for planners and learners from the excerpts. "
+                    "Stay close to retrieved wording; distinguish established findings vs tentative claims. "
+                    "If overlaps or contradictions appear across snippets, say so briefly.\n"
+                    "Output format:\n"
+                    "- 3–6 short bullets tuned to what the student asked\n"
+                    "- When you add evidence brackets, use only tags that exactly copy a source_file= filename "
+                    "from the retrieved lines above (same spelling and punctuation). Do not bracket any other "
+                    "filename or invented short name; if none apply, omit bracket tags."
+                )
+            else:
+                retrieval_guide = (
+                    "Given retrieved snippets for one course/week, list the main studied topics only. "
+                    "Do not mention unrelated details. If evidence is weak, say so.\n"
+                    "Output format:\n"
+                    "- 3-6 topic bullets\n"
+                    "- Optional short evidence note per topic using filename only in brackets, e.g. [lecture3.pdf]"
+                )
             prompt_messages = non_tool_messages + [
-                SystemMessage(
-                    content=(
-                        "Given retrieved snippets for one course/week, list the main studied topics only. "
-                        "Do not mention unrelated details. If evidence is weak, say so.\n"
-                        "Output format:\n"
-                        "- 3-6 topic bullets\n"
-                        "- Optional short evidence note per topic using filename only in brackets, e.g. [lecture3.pdf]"
-                    )
-                ),
+                SystemMessage(content=retrieval_guide),
                 HumanMessage(content=user_payload),
             ]
     else:
         prompt_messages = messages
 
+    mem_text = _format_planner_memory_for_prompt(_get_planner_memory(state))
+    if mem_text.strip():
+        prompt_messages = [SystemMessage(content=mem_text)] + prompt_messages
+
     response = get_llm().invoke(prompt_messages)
+    if getattr(response, "tool_calls", None):
+        response = _aimessage_with_forced_c6_paper_id(response, user_query)
     if getattr(response, "tool_calls", None):
         tool_names = [str(call.get("name", "")).strip() for call in response.tool_calls if isinstance(call, dict)]
         logging.getLogger(__name__).info(
@@ -2600,6 +3204,21 @@ def agent_node(state: AgentState):
         )
     else:
         logging.getLogger(__name__).info("agent_loop_debug model_requested_tools count=0")
+        if (
+            messages
+            and getattr(messages[-1], "type", None) == "tool"
+            and str(getattr(messages[-1], "name", "")).strip() == "kb_external_research_retrieval"
+            and _c6_is_single_paper_user_query(user_query)
+        ):
+            answer_text = _render_assistant_content(response.content)
+            if not _c6_final_citations_match_retrieval(answer_text, str(messages[-1].content)):
+                response = AIMessage(
+                    content=(
+                        "I couldn't match every [.pdf] citation in my reply to this retrieval: each bracket tag "
+                        "must exactly copy a source_file= value from the evidence block, with no other filenames "
+                        "in brackets."
+                    )
+                )
     _trace_log("agent_node llm_response has_tool_calls=%s", bool(getattr(response, "tool_calls", None)))
     if getattr(response, "tool_calls", None):
         _trace_log("agent_node tool_calls=%s", getattr(response, "tool_calls", None))
@@ -2640,7 +3259,7 @@ def verifier_node(state: AgentState):
     if not is_weak:
         return {"messages": messages, "planner_memory": merged_memory}
 
-    question = _clarifying_question_for_tool(tool_name)
+    question = _clarifying_question_for_tool(tool_name, reason)
     return {"messages": messages + [AIMessage(content=question)], "planner_memory": merged_memory}
 
 
@@ -2706,11 +3325,16 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     logging.getLogger(__name__).info("PLANNER_RAG_MODE=%s", get_settings().rag_mode.value)
     print(f"[ablation] PLANNER_RAG_MODE={get_settings().rag_mode.value}")
-    print("\nPlanner agent (C1 + C2 + C3 + C4 + C5) ready. Type 'exit' to quit.\n")
+    print("\nPlanner agent (C1 + C2 + C3 + C4 + C5 + C6) ready. Type 'exit' to quit.\n")
+    session_memory: dict[str, Any] = {}
     while True:
         user_text = input("You: ").strip()
         if user_text.lower() in {"exit", "quit"}:
             break
+        if not user_text:
+            # Empty line would create HumanMessage("") which LangChain drops; Gemini then
+            # receives no `contents` and raises ValueError: contents are required.
+            continue
 
         result = app.invoke(
             {
@@ -2718,8 +3342,11 @@ if __name__ == "__main__":
                     SYSTEM_PROMPT,
                     HumanMessage(content=user_text),
                 ],
-                "planner_memory": {},
+                "planner_memory": dict(session_memory),
             }
         )
+        merged = result.get("planner_memory")
+        if isinstance(merged, dict):
+            session_memory = dict(merged)
         last = result["messages"][-1]
         print(f"\nAgent: {_render_assistant_content(last.content)}\n")
