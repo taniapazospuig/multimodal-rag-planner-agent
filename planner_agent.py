@@ -3167,6 +3167,8 @@ def agent_node(state: AgentState):
                     "Summarize actionable, research-grounded guidance for planners and learners from the excerpts. "
                     "Stay close to retrieved wording; distinguish established findings vs tentative claims. "
                     "If overlaps or contradictions appear across snippets, say so briefly.\n"
+                    "Relevance: Lead with bullets that directly answer the question; deprioritize or omit excerpts "
+                    "from loosely related papers when they do not help.\n"
                     "Output format:\n"
                     "- 3–6 short bullets tuned to what the student asked\n"
                     "- When you add evidence brackets, use only tags that exactly copy a source_file= filename "
