@@ -706,7 +706,8 @@ class CourseRetriever:
     C1 restricts to rows tagged ``course-content`` in ``documents.csv``; C6 to ``evidence``.
     Other callers omit doc allowlists when searching planner or study-environment corpora.
 
-    Text ranking strategy is controlled by TEXT_RETRIEVAL_STRATEGY (hybrid|dense_only).
+    Text ranking strategy is controlled by ``TEXT_RETRIEVAL_STRATEGY``
+    (``hybrid`` | ``dense_only`` | ``bm25_only``).
     RAG_MODE controls whether image retrieval/fusion is applied
     (multimodal_retrieval_mllm only) or text hits are returned directly.
     Optional course/week metadata filtering is applied via Chroma where and BM25 post-filter.
@@ -1004,11 +1005,10 @@ class CourseRetriever:
         course_filter: str,
         week_filter: str,
         *,
-        strategy_override: TextRetrievalStrategy | None = None,
         enable_multimodal_fusion: bool | None = None,
         restrict_doc_ids: frozenset[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Run configured retrieval strategy with optional course/week filters.
+        """Run text retrieval per ``Settings.text_retrieval_strategy`` (from ``TEXT_RETRIEVAL_STRATEGY``).
 
         When ``restrict_doc_ids`` is set (e.g. C1 CourseQA), fused hits are limited to chunks whose
         ``doc_id`` is in ``documents.csv`` with that cohort (typically ``course-content`` tags).
@@ -1029,7 +1029,7 @@ class CourseRetriever:
             else:
                 dense_where = {"$and": [dense_where, doc_clause]}
 
-        strategy = strategy_override or self.settings.text_retrieval_strategy
+        strategy = self.settings.text_retrieval_strategy
         _trace_log(
             "retrieval.search query=%r top_k=%d strategy=%s use_meta=%s eff_course=%r eff_week=%r "
             "restrict_doc_ids=%s where=%s",
@@ -1054,6 +1054,17 @@ class CourseRetriever:
             )
             _trace_log("retrieval.candidates dense_only count=%d dense_head=%s", len(dense_ids), dense_ids[:3])
             for rank, chunk_id in enumerate(dense_ids, start=1):
+                fused_scores[chunk_id] = 1.0 / float(rank)
+        elif strategy == TextRetrievalStrategy.BM25_ONLY:
+            bm25_ids = self._bm25_search(
+                query=query,
+                course_filter=eff_course,
+                week_filter=eff_week,
+                n_results=max(top_k, self.settings.bm25_k),
+                restrict_doc_ids=restrict_doc_ids,
+            )
+            _trace_log("retrieval.candidates bm25_only count=%d bm25_head=%s", len(bm25_ids), bm25_ids[:3])
+            for rank, chunk_id in enumerate(bm25_ids, start=1):
                 fused_scores[chunk_id] = 1.0 / float(rank)
         else:
             dense_ids = self._dense_search(
@@ -1131,13 +1142,13 @@ class CourseRetriever:
         top_k: int,
         *,
         allowed_doc_ids: frozenset[str] | None = None,
-        strategy_override: TextRetrievalStrategy | None = None,
         enable_multimodal_fusion: bool | None = None,
     ) -> list[dict[str, Any]]:
         """
         Retrieval over KB chunks whose ``documents.csv`` ``tags`` value is ``evidence`` (C6 Research QA).
 
-        ``allowed_doc_ids`` further narrows to a subset when non-``None`` (intersected with evidence docs).
+        Uses ``Settings.text_retrieval_strategy`` (``TEXT_RETRIEVAL_STRATEGY``). ``allowed_doc_ids``
+        further narrows to a subset when non-``None`` (intersected with evidence docs).
         """
         if allowed_doc_ids is not None and len(allowed_doc_ids) == 0:
             return []
@@ -1166,7 +1177,7 @@ class CourseRetriever:
                 return False
             return True
 
-        strategy = strategy_override or self.settings.text_retrieval_strategy
+        strategy = self.settings.text_retrieval_strategy
         fused_scores: dict[str, float] = {}
         dense_ids: list[str] = []
         bm25_ids: list[str] = []
@@ -1181,6 +1192,19 @@ class CourseRetriever:
                 dense_ids[:3],
             )
             for rank, chunk_id in enumerate(dense_ids, start=1):
+                fused_scores[chunk_id] = 1.0 / float(rank)
+        elif strategy == TextRetrievalStrategy.BM25_ONLY:
+            bm25_ids = self._bm25_search_with_predicate(
+                query=query,
+                n_results=max(top_k, self.settings.bm25_k),
+                row_predicate=row_ok,
+            )
+            _trace_log(
+                "retrieval.external bm25_only count=%d bm25_head=%s",
+                len(bm25_ids),
+                bm25_ids[:3],
+            )
+            for rank, chunk_id in enumerate(bm25_ids, start=1):
                 fused_scores[chunk_id] = 1.0 / float(rank)
         else:
             dense_ids = self._dense_search(
@@ -1756,7 +1780,6 @@ def _extract_events_from_planner_screenshots(
         top_k=max(6, int(top_k)),
         course_filter="personal-planner",
         week_filter=normalized_week,
-        strategy_override=TextRetrievalStrategy.DENSE_ONLY,
         enable_multimodal_fusion=False,
     )
     logger.info("c2_debug screenshot_extract retrieval_hits count=%d", len(hits))

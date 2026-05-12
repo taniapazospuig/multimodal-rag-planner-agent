@@ -29,9 +29,10 @@ class RAGPipelineMode(str, Enum):
 
 
 class TextRetrievalStrategy(str, Enum):
-    """Supported text retrieval strategies."""
+    """Supported text retrieval strategies (``TEXT_RETRIEVAL_STRATEGY``)."""
     HYBRID = "hybrid"
     DENSE_ONLY = "dense_only"
+    BM25_ONLY = "bm25_only"
 
 
 @dataclass(frozen=True)
@@ -58,12 +59,6 @@ class Settings:
     bm25_k: int
     hybrid_k: int
     rrf_k: int
-    text_reranker_enabled: bool
-    text_reranker_model: str
-    text_rerank_top_n: int
-    visual_rerank_enabled: bool
-    visual_reranker_model: str
-    visual_rerank_top_n: int
     multimodal_fusion_alpha: float
     multimodal_fusion_k: int
     course_filter_enabled: bool
@@ -144,16 +139,6 @@ def load_settings() -> Settings:
         bm25_k=_int_env("TEXT_BM25_K", 12),
         hybrid_k=_int_env("TEXT_HYBRID_K", 6),
         rrf_k=_int_env("TEXT_RRF_K", 60),
-        text_reranker_enabled=_bool_env("TEXT_RERANKER_ENABLED", True),
-        text_reranker_model=(
-            os.environ.get("TEXT_RERANKER_MODEL") or "cross-encoder/ms-marco-MiniLM-L-6-v2"
-        ).strip(),
-        text_rerank_top_n=_int_env("TEXT_RERANK_TOP_N", 16),
-        visual_rerank_enabled=_bool_env("VISUAL_RERANK_ENABLED", False),
-        visual_reranker_model=(
-            os.environ.get("VISUAL_RERANKER_MODEL") or "Salesforce/blip-itm-base-coco"
-        ).strip(),
-        visual_rerank_top_n=_int_env("VISUAL_RERANK_TOP_N", 8),
         multimodal_fusion_alpha=_float_env("MULTIMODAL_FUSION_ALPHA", 0.7, 0.0, 1.0),
         multimodal_fusion_k=_int_env("MULTIMODAL_FUSION_K", 8),
         course_filter_enabled=_bool_env("COURSE_FILTER_ENABLED", True),
