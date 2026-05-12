@@ -3,7 +3,7 @@
 RAG_MODE ?= text_retrieval_mllm
 
 # A/B retrieval: metadata filters narrow Chroma + BM25 to resolved course/week (see config.RETRIEVAL_METADATA_FILTER_ENABLED).
-# - planner / planner-filter: filtering ON (default baseline)
+# - planner-filter: filtering ON (default baseline)
 # - planner-nofilter: filtering OFF (rank over whole KB)
 
 ingest:

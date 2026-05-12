@@ -1,9 +1,10 @@
 """
-Minimal planner agent with four capabilities:
+Minimal planner agent with five capability labels:
 - C1 TopicSummary (topics studied in course/week from retrieved evidence)
 - C2 DurationEstimator (estimate study time for a course-related task)
 - C3 FreeSlotFinder (find open slots in a target week/day)
 - C4 StudyEnvironmentRecommender (suggest where to do a task)
+- C5 StudyEnvironmentFit (judge a specific environment for a task)
 
 This module intentionally reuses already-built retrieval artifacts:
 - Chroma DB in `chroma_db` (dense index)
@@ -32,7 +33,7 @@ from rank_bm25 import BM25Okapi
 from urllib3.exceptions import NotOpenSSLWarning
 
 from langchain.tools import tool
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
@@ -55,6 +56,7 @@ class AgentState(TypedDict):
     """State carried between LangGraph nodes."""
 
     messages: List[BaseMessage]
+    planner_memory: dict[str, Any]
 
 
 def load_courses(path: Path) -> list[dict[str, str]]:
@@ -1718,26 +1720,31 @@ def _run_study_environment_tool(
     top_k: int = 4,
 ) -> str:
     """
-    Shared C4 helper used by recommendation and targeted assessment tools.
+    Shared helper: C4 (recommend) vs C5 (assess fit) study-environment tools.
     """
     targeted_mode = mode == "assess"
+    header = "C5_STUDY_ENVIRONMENT" if targeted_mode else "C4_STUDY_ENVIRONMENT"
     raw_query = query.strip() or task_query.strip()
     normalized_query = raw_query
     if not normalized_query:
-        return "C4_STUDY_ENVIRONMENT:\nquery field was missing."
+        return f"{header}:\nquery field was missing."
     env_rows = get_study_environment_rows()
     if not env_rows:
-        return "C4_STUDY_ENVIRONMENT:\nNo study environments metadata found."
+        return f"{header}:\nNo study environments metadata found."
 
     settings = get_settings()
     text_scores, text_excerpts = _query_study_environment_text_scores(
         normalized_query,
         top_k=max(8, int(top_k) * 3),
     )
-    multimodal_on = settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM
+    multimodal_retrieval_on = settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM
+    mllm_understanding_on = settings.rag_mode in {
+        RAGPipelineMode.TEXT_RETRIEVAL_MLLM,
+        RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM,
+    }
     image_scores = (
         _query_study_environment_image_scores(normalized_query, top_k=max(6, int(top_k) * 2))
-        if multimodal_on
+        if multimodal_retrieval_on
         else {}
     )
     query_terms = {
@@ -1765,7 +1772,7 @@ def _run_study_environment_tool(
 
         # Retrieval confidence only. Final suitability decision is delegated to LLM.
         retrieval_support_score = text_score
-        if multimodal_on:
+        if multimodal_retrieval_on:
             retrieval_support_score = 0.65 * text_score + 0.35 * image_score
         candidates.append(
             {
@@ -1781,23 +1788,28 @@ def _run_study_environment_tool(
         )
     candidates.sort(key=lambda item: float(item.get("retrieval_support_score", 0.0)), reverse=True)
     if not candidates:
-        return "C4_STUDY_ENVIRONMENT:\nNo candidate environments found."
+        return f"{header}:\nNo candidate environments found."
 
     targeted_environment_id = (
         _resolve_environment_hint(environment_hint or raw_query, env_rows) if targeted_mode else ""
     )
     if targeted_mode and not targeted_environment_id:
         return (
-            "C4_STUDY_ENVIRONMENT:\n"
+            f"{header}:\n"
             "Could not resolve the requested environment. "
             "Provide environment_hint using environment_id or environment_type."
         )
     image_grounding_guidance = (
-        "When evidence_mode is multimodal_index+images, explicitly ground your reasoning in observable "
+        "When image evidence is available, explicitly ground your reasoning in observable "
         "image characteristics (for example: visible natural light, crowd density, desk/chair setup, "
         "indoor vs outdoor context, and distraction cues).\n"
-        if multimodal_on
+        if mllm_understanding_on
         else ""
+    )
+    evidence_mode = (
+        "multimodal_index+images"
+        if multimodal_retrieval_on
+        else ("text_index+images" if mllm_understanding_on else "text_index_only")
     )
     llm_candidates = candidates[: max(3, min(8, int(top_k) * 2))]
     llm_prompt = [
@@ -1824,7 +1836,7 @@ def _run_study_environment_tool(
                 f"rag_mode={settings.rag_mode.value}\n"
                 f"mode={mode}\n"
                 f"target_environment_id={targeted_environment_id or 'none'}\n"
-                f"evidence_mode={'multimodal_index+images' if multimodal_on else 'text_index_only'}\n"
+                f"evidence_mode={evidence_mode}\n"
                 f"candidates_json={json.dumps(llm_candidates, ensure_ascii=True)}"
             )
         ),
@@ -1872,22 +1884,22 @@ def _run_study_environment_tool(
         "justification": short_justification
         or "Chosen by LLM based on factor fit and available retrieval evidence.",
         "factor_rationale": rationale_items,
-        "observable_image_evidence": image_evidence_items if multimodal_on else [],
+        "observable_image_evidence": image_evidence_items if mllm_understanding_on else [],
         "verdict": verdict,
         "assessment_mode": "targeted" if targeted_mode else "recommendation",
         "confidence": confidence,
     }
 
     lines = [
-        "C4_STUDY_ENVIRONMENT:",
+        f"{header}:",
         (
             f"Applied mode -> rag_mode={settings.rag_mode.value} | "
-            f"evidence_mode={'multimodal_index+images' if multimodal_on else 'text_index_only'} | top_k={max(1, int(top_k))}"
+            f"evidence_mode={evidence_mode} | top_k={max(1, int(top_k))}"
         ),
         f"query={normalized_query}",
         f"ASSESSMENT_MODE={'targeted' if targeted_mode else 'recommendation'}",
         f"TARGET_ENVIRONMENT_ID={targeted_environment_id or ''}",
-        f"MULTIMODAL_IMAGE_GROUNDING_REQUIRED={1 if multimodal_on else 0}",
+        f"MULTIMODAL_IMAGE_GROUNDING_REQUIRED={1 if mllm_understanding_on else 0}",
         "Top candidates:",
     ]
     for rank, candidate in enumerate(candidates[: max(1, int(top_k))], start=1):
@@ -1907,7 +1919,7 @@ def _run_study_environment_tool(
     lines.append(f"LLM_SELECTION_JSON={json.dumps(parsed_selection, ensure_ascii=True)}")
     lines.append(f"RECOMMENDATION_JSON={json.dumps(recommendation, ensure_ascii=True)}")
 
-    if multimodal_on:
+    if mllm_understanding_on:
         image_paths: list[str] = []
         for candidate in candidates[: max(1, min(int(top_k), 3))]:
             rel = str(candidate.get("source_file_path", "")).strip()
@@ -1928,11 +1940,12 @@ def recommend_study_environment(
     top_k: int = 4,
 ) -> str:
     """
-    C4a environment recommender: choose where a task should be done.
+    C4 environment recommender: choose where a task should be done.
 
     Ablation behavior:
     - text_only: uses study_environments.jsonl + indexed text retrieval for study-location photos.
-    - multimodal_retrieval_mllm: additionally uses original study-location photo evidence from planner_images.
+    - text_retrieval_mllm: keeps text retrieval, but passes candidate images to MLLM for final understanding.
+    - multimodal_retrieval_mllm: additionally uses planner_images retrieval for candidate ranking and MLLM input.
     """
     return _run_study_environment_tool(
         mode="recommend",
@@ -1950,7 +1963,7 @@ def assess_study_environment_fit(
     top_k: int = 4,
 ) -> str:
     """
-    C4b targeted assessment: judge whether a specific environment is good for the task.
+    C5 targeted assessment: judge whether a specific environment is good for the task.
 
     Example prompt:
     - "Is it a good idea to do this task in common study space?"
@@ -1975,19 +1988,20 @@ TOOLS = [
 
 SYSTEM_PROMPT = SystemMessage(
     content=(
-        "You are a study planner assistant with four capabilities.\n"
+        "You are a study planner assistant with five capability labels C1–C5.\n"
         "C1 TopicSummary: summarize topics studied in a course/week using kb_course_retrieval.\n"
         "C2 DurationEstimator: estimate task minutes with estimate_study_duration.\n"
         "C3 FreeSlotFinder: find open schedule slots with find_free_slots.\n"
-        "C4 StudyEnvironment: use recommend_study_environment to choose where to work, "
-        "or assess_study_environment_fit to judge a specific environment.\n"
+        "C4 StudyEnvironmentRecommender: use recommend_study_environment to choose where to work.\n"
+        "C5 StudyEnvironmentFit: use assess_study_environment_fit to judge a specific environment for a task.\n"
         "Respect dataset week tags like week-01..week-07 and easter-week.\n"
         "Routing rules:\n"
         "- If user asks to estimate duration, call estimate_study_duration.\n"
         "- If user asks to summarize topics/content, call kb_course_retrieval first.\n"
         "- If user asks for free slots, call find_free_slots.\n"
-        "- If user asks where to do a task or asks for best study place/environment, call recommend_study_environment first.\n"
-        "- If user asks 'Is it a good idea to do this task in [environment]?', call assess_study_environment_fit first and preserve the environment mention in environment_hint.\n"
+        "- If user asks where to do a task or asks for best study place/environment, call recommend_study_environment first (C4).\n"
+        "- If user asks 'Is it a good idea to do this task in [environment]?', call assess_study_environment_fit first (C5) "
+        "and preserve the environment mention in environment_hint.\n"
         "Always include required tool arguments."
     )
 )
@@ -2046,10 +2060,15 @@ def get_reasoning_llm():
 
 
 def _latest_user_text(messages: list[BaseMessage]) -> str:
-    """Get the latest user text for post-tool answer composition."""
+    """Latest non-empty HumanMessage string; used only for internal verifier heuristics."""
     for message in reversed(messages):
-        if isinstance(message, HumanMessage):
-            return str(message.content)
+        if not isinstance(message, HumanMessage):
+            continue
+        content = message.content
+        if isinstance(content, str):
+            text = content.strip()
+            if text:
+                return text
     return ""
 
 
@@ -2089,8 +2108,285 @@ def _image_path_to_data_url(path: str, max_edge: int) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
+def _user_has_explicit_week_signal(user_query: str) -> bool:
+    """Detect whether user text explicitly constrains a week-like time scope."""
+    normalized = _normalize_for_match(user_query)
+    if not normalized:
+        return False
+    if _detect_week_filter(normalized):
+        return True
+    relative_signals = ("this week", "next week", "tonight", "today", "tomorrow")
+    return any(signal in normalized for signal in relative_signals)
+
+
+def _query_has_explicit_calendar_date(user_query: str) -> bool:
+    """True if the user names a concrete calendar day (not a bare weekday)."""
+    normalized = _normalize_for_match(user_query)
+    if not normalized:
+        return False
+    if re.search(r"\b20\d{2}-\d{2}-\d{2}\b", normalized):
+        return True
+    if re.search(r"\b\d{1,2}/\d{1,2}/(20)?\d{2}\b", normalized):
+        return True
+    # "31 mar", "mar 31", "31st march"
+    months = (
+        "jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
+    )
+    if re.search(rf"\b\d{{1,2}}(st|nd|rd|th)?\s+({months})\b", normalized):
+        return True
+    if re.search(rf"\b({months})\s+\d{{1,2}}(st|nd|rd|th)?\b", normalized):
+        return True
+    return False
+
+
+def _get_planner_memory(state: AgentState) -> dict[str, Any]:
+    raw = state.get("planner_memory")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _parse_applied_filters_from_blob(text: str) -> dict[str, str]:
+    """Best-effort course/week/day from tool transcript lines (Applied filters -> ...)."""
+    course_m = re.search(r"\bcourse=([^\s|]+)", text, re.I)
+    week_m = re.search(r"\bweek=([^\s|]+)", text, re.I)
+    day_m = re.search(r"\bday=([^\s|]+)", text, re.I)
+
+    def grab(match):
+        if not match:
+            return ""
+        v = match.group(1).strip().lower()
+        return "" if v in {"", "none", "unknown", "?"} else v
+
+    return {
+        "resolved_course": grab(course_m),
+        "resolved_week": grab(week_m),
+        "resolved_day": grab(day_m),
+    }
+
+
+def _tool_call_args_for_executed_tool(messages: list[BaseMessage], tool_name: str) -> dict[str, Any]:
+    """Args from the AIMessage tool call that produced the last ToolMessage."""
+    if len(messages) < 2 or getattr(messages[-1], "type", None) != "tool":
+        return {}
+    want_id = str(getattr(messages[-1], "tool_call_id", "") or "")
+    for i in range(len(messages) - 2, -1, -1):
+        m = messages[i]
+        calls = getattr(m, "tool_calls", None) or []
+        if not calls:
+            continue
+        fallback: dict[str, Any] | None = None
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            if str(call.get("name", "")).strip() != tool_name:
+                continue
+            args = call.get("args")
+            if not isinstance(args, dict):
+                continue
+            cid = str(call.get("id", ""))
+            if want_id and cid and cid == want_id:
+                return dict(args)
+            fallback = dict(args)
+        if fallback is not None:
+            return fallback
+        break
+    return {}
+
+
+_CAPABILITY_BY_TOOL: dict[str, str] = {
+    "kb_course_retrieval": "c1",
+    "estimate_study_duration": "c2",
+    "find_free_slots": "c3",
+    "recommend_study_environment": "c4",
+    "assess_study_environment_fit": "c5",
+}
+
+
+def _build_planner_memory_patch(
+    tool_name: str,
+    tool_result: str,
+    call_args: dict[str, Any],
+) -> dict[str, Any]:
+    parsed = _parse_applied_filters_from_blob(tool_result)
+    rc = str(call_args.get("course_filter", "")).strip().lower()
+    rw = str(call_args.get("week_filter", "")).strip().lower()
+    rd = str(call_args.get("day_filter", "")).strip().lower()
+    return {
+        "capability": _CAPABILITY_BY_TOOL.get(tool_name, ""),
+        "last_tool_name": tool_name,
+        "last_tool_summary": _truncate_for_log(tool_result, 240),
+        "resolved_course": rc or parsed["resolved_course"],
+        "resolved_week": rw or parsed["resolved_week"],
+        "resolved_day": rd or parsed["resolved_day"],
+    }
+
+
+def _c3_has_time_anchor(
+    user_query: str,
+    tool_call_args: dict[str, Any],
+    tool_result: str,
+) -> bool:
+    """
+    Prefer structured scope from the tool call / resolved filters; fall back to user text
+    (week phrases, calendar date). Bare weekday in user text alone is not enough.
+    """
+    wf = str(tool_call_args.get("week_filter", "")).strip().lower()
+    df = str(tool_call_args.get("day_filter", "")).strip().lower()
+    if wf and wf not in {"", "none", "unknown", "?"}:
+        return True
+    if df and df not in {"", "none", "unknown", "?", "all"}:
+        return True
+
+    parsed = _parse_applied_filters_from_blob(tool_result)
+    wk = parsed.get("resolved_week", "")
+    if wk:
+        return True
+    day_out = parsed.get("resolved_day", "")
+    if day_out and day_out not in {"", "all", "none", "unknown", "?"}:
+        return True
+
+    if _user_has_explicit_week_signal(user_query) or _query_has_explicit_calendar_date(user_query):
+        return True
+    return False
+
+
+def _c2_query_is_underspecified(user_query: str) -> bool:
+    """Heuristic: duration request lacks concrete task scope/material detail."""
+    normalized = _normalize_for_match(user_query)
+    if not normalized:
+        return True
+    has_week_scope = _user_has_explicit_week_signal(normalized)
+    has_specific_material = any(
+        keyword in normalized
+        for keyword in (
+            "lecture",
+            "tutorial",
+            "assignment",
+            "project",
+            "exam",
+            "quiz",
+            "lab",
+            "homework",
+            "notes",
+            "slides",
+            "practice",
+            "question",
+            "report",
+            "deliverable",
+            "applied class",
+        )
+    )
+    return not has_week_scope and not has_specific_material
+
+
+def _tool_output_is_weak(
+    tool_name: str,
+    tool_result: str,
+    user_query: str = "",
+    *,
+    tool_call_args: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Minimal post-tool verification for required payload fields and evidence strength."""
+    text = tool_result.strip()
+    lower = text.lower()
+    weak_markers = (
+        "query field was missing",
+        "no grounded snippets found",
+        "did not return valid json",
+        "insufficient planner evidence",
+        "no planner rows matched",
+        "no candidate environments found",
+        "could not resolve the requested environment",
+    )
+    if any(marker in lower for marker in weak_markers):
+        return True, "weak_evidence"
+
+    if tool_name == "kb_course_retrieval":
+        has_ranked_hits = re.search(r"(?m)^\d+\.\s+score=", text) is not None
+        if "C1A_RETRIEVAL_RESULTS:" not in text or not has_ranked_hits:
+            return True, "missing_retrieval_hits"
+        # Require either explicit user constraints or non-empty resolved filters for broad topic-summary prompts.
+        applied_match = re.search(r"Applied filters ->[^\n]*course=([^\s|]+)[^\n]*week=([^\s|]+)", text)
+        resolved_course = (applied_match.group(1).strip().lower() if applied_match else "")
+        resolved_week = (applied_match.group(2).strip().lower() if applied_match else "")
+        no_course_week_filters = (
+            resolved_course in {"", "none", "unknown", "?"}
+            and resolved_week in {"", "none", "unknown", "?"}
+        )
+        query_has_scope = bool(_detect_course_filter(user_query)) or _user_has_explicit_week_signal(user_query)
+        if no_course_week_filters and not query_has_scope:
+            return True, "broad_query_without_scope_filters"
+        return False, ""
+
+    if tool_name == "estimate_study_duration":
+        if "C2_DURATION_ESTIMATE:" not in text or "ESTIMATE_JSON=" not in text:
+            return True, "missing_estimate_json"
+        match = re.search(r"REQUIRED_MINUTES=(\d+)", text)
+        if not match or int(match.group(1)) <= 0:
+            return True, "non_positive_minutes"
+        week_match = re.search(r"Applied filters ->[^\n]*week=([^\s|]+)", text)
+        resolved_week = week_match.group(1).strip().lower() if week_match else ""
+        outcome_match = re.search(r"Applied filters ->[^\n]*outcome=([^\s|]+)", text)
+        resolved_outcome = outcome_match.group(1).strip().lower() if outcome_match else ""
+        if (
+            resolved_week in {"", "none", "unknown", "?"}
+            and resolved_outcome in {"", "none", "unknown", "?", "unspecified"}
+            and _c2_query_is_underspecified(user_query)
+        ):
+            return True, "underspecified_duration_request"
+        return False, ""
+
+    if tool_name == "find_free_slots":
+        if "C3_FREE_SLOTS:" not in text or "SLOTS_JSON=" not in text:
+            return True, "missing_slots_json"
+        if not _c3_has_time_anchor(user_query, tool_call_args or {}, text):
+            return True, "no_user_time_scope"
+        return False, ""
+
+    if tool_name == "recommend_study_environment":
+        if "C4_STUDY_ENVIRONMENT:" not in text or "RECOMMENDATION_JSON=" not in text:
+            return True, "missing_environment_json"
+        return False, ""
+
+    if tool_name == "assess_study_environment_fit":
+        if "C5_STUDY_ENVIRONMENT:" not in text or "RECOMMENDATION_JSON=" not in text:
+            return True, "missing_environment_json"
+        return False, ""
+
+    return False, ""
+
+
+def _clarifying_question_for_tool(tool_name: str) -> str:
+    """Short clarification when verification fails (no user-quote; keeps copy generic)."""
+    if tool_name == "kb_course_retrieval":
+        return (
+            "I could not find strong grounded course evidence. "
+            "Could you specify the course and week (for example, operations-research, week-03)?"
+        )
+    if tool_name == "estimate_study_duration":
+        return (
+            "I could not produce a reliable duration estimate. "
+            "Could you clarify task scope and target outcome (for example, revision depth or deliverable)?"
+        )
+    if tool_name == "find_free_slots":
+        return (
+            "I could not verify reliable planner evidence for free-slot computation. "
+            "Could you provide a specific week and optional day (for example, week-03, Tue)?"
+        )
+    if tool_name == "recommend_study_environment":
+        return (
+            "I need a bit more detail to recommend a study environment (C4). "
+            "Could you include the task type and any priority constraints (quiet, internet, duration)?"
+        )
+    if tool_name == "assess_study_environment_fit":
+        return (
+            "I need a bit more detail to assess environment fit (C5). "
+            "Could you include the task type, which environment you mean, and any priority constraints?"
+        )
+    return "I need a bit more detail to give a reliable grounded answer. Could you clarify?"
+
+
 def agent_node(state: AgentState):
-    """LLM node: routes tool calls and composes final C1/C2/C3/C4 responses."""
+    """LLM node: routes tool calls and composes final C1–C5 responses."""
     messages = state["messages"]
     user_query = _latest_user_text(messages)
     _trace_log("agent_node enter last_message_type=%s user_query=%r", getattr(messages[-1], "type", "unknown"), user_query)
@@ -2175,7 +2471,10 @@ def agent_node(state: AgentState):
                 f"{tool_result}"
             )
             image_paths = _extract_image_paths(tool_result)
-            include_images = settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM
+            include_images = settings.rag_mode in {
+                RAGPipelineMode.TEXT_RETRIEVAL_MLLM,
+                RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM,
+            }
             c4_user_payload: str | list[dict[str, Any]]
             if include_images and image_paths:
                 multimodal_content: list[dict[str, Any]] = [{"type": "text", "text": c4_payload_text}]
@@ -2187,7 +2486,8 @@ def agent_node(state: AgentState):
                     multimodal_content.append({"type": "image_url", "image_url": {"url": data_url}})
                     attached_count += 1
                 logging.getLogger(__name__).info(
-                    "mllm_input_c4 mode=%s candidate_images=%d attached_images=%d",
+                    "mllm_input_c4_c5 tool=%s mode=%s candidate_images=%d attached_images=%d",
+                    tool_name,
                     settings.rag_mode.value,
                     len(image_paths),
                     attached_count,
@@ -2198,7 +2498,11 @@ def agent_node(state: AgentState):
             prompt_messages = non_tool_messages + [
                 SystemMessage(
                     content=(
-                        "Produce a concise C4 environment answer.\n"
+                        (
+                            "Produce a concise C5 environment-fit answer.\n"
+                            if targeted_mode
+                            else "Produce a concise C4 environment recommendation answer.\n"
+                        )
                         + (
                             "If assessment_mode is targeted, answer whether that specific environment is a good idea "
                             "for the task (yes/maybe/no) and explain why using environment characteristics.\n"
@@ -2303,6 +2607,43 @@ def agent_node(state: AgentState):
     return {"messages": messages + [response]}
 
 
+def verifier_node(state: AgentState):
+    """
+    Post-tool verifier node.
+
+    If tool output is weak/malformed, return a clarifying AI message instead of
+    continuing to final synthesis.
+    """
+    messages = state["messages"]
+    if not messages or getattr(messages[-1], "type", None) != "tool":
+        return {}
+
+    tool_name = str(getattr(messages[-1], "name", "")).strip()
+    tool_result = str(messages[-1].content)
+    call_args = _tool_call_args_for_executed_tool(messages, tool_name)
+    mem_patch = _build_planner_memory_patch(tool_name, tool_result, call_args)
+    merged_memory = {**_get_planner_memory(state), **mem_patch}
+
+    user_query = _latest_user_text(messages)
+    is_weak, reason = _tool_output_is_weak(
+        tool_name,
+        tool_result,
+        user_query=user_query,
+        tool_call_args=call_args,
+    )
+    logging.getLogger(__name__).info(
+        "agent_loop_debug verifier tool=%s weak=%s reason=%s",
+        tool_name,
+        is_weak,
+        reason or "ok",
+    )
+    if not is_weak:
+        return {"messages": messages, "planner_memory": merged_memory}
+
+    question = _clarifying_question_for_tool(tool_name)
+    return {"messages": messages + [AIMessage(content=question)], "planner_memory": merged_memory}
+
+
 def route_after_agent(state: AgentState):
     """Route to tool execution if the model emitted tool calls."""
     last = state["messages"][-1]
@@ -2322,14 +2663,26 @@ def route_after_agent(state: AgentState):
     return END
 
 
+def route_after_verifier(state: AgentState):
+    """If verifier added a clarifying AI message, end; otherwise continue."""
+    last = state["messages"][-1]
+    if getattr(last, "type", None) == "ai":
+        logging.getLogger(__name__).info("agent_loop_debug verifier_route=end")
+        return END
+    logging.getLogger(__name__).info("agent_loop_debug verifier_route=agent")
+    return "agent"
+
+
 tool_node = ToolNode(TOOLS)
 
 graph = StateGraph(AgentState)
 graph.add_node("agent", agent_node)
 graph.add_node("tools", tool_node)
+graph.add_node("verifier", verifier_node)
 graph.set_entry_point("agent")
 graph.add_conditional_edges("agent", route_after_agent, {"tools": "tools", END: END})
-graph.add_edge("tools", "agent")
+graph.add_conditional_edges("verifier", route_after_verifier, {"agent": "agent", END: END})
+graph.add_edge("tools", "verifier")
 app = graph.compile()
 
 
@@ -2353,7 +2706,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     logging.getLogger(__name__).info("PLANNER_RAG_MODE=%s", get_settings().rag_mode.value)
     print(f"[ablation] PLANNER_RAG_MODE={get_settings().rag_mode.value}")
-    print("\nPlanner agent (C1 + C2 + C3 + C4) ready. Type 'exit' to quit.\n")
+    print("\nPlanner agent (C1 + C2 + C3 + C4 + C5) ready. Type 'exit' to quit.\n")
     while True:
         user_text = input("You: ").strip()
         if user_text.lower() in {"exit", "quit"}:
@@ -2364,7 +2717,8 @@ if __name__ == "__main__":
                 "messages": [
                     SYSTEM_PROMPT,
                     HumanMessage(content=user_text),
-                ]
+                ],
+                "planner_memory": {},
             }
         )
         last = result["messages"][-1]
