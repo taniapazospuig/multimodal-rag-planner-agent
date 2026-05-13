@@ -22,6 +22,7 @@ import csv
 import json
 import logging
 import re
+import uuid
 import warnings
 from collections import defaultdict
 from datetime import date, datetime
@@ -39,7 +40,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from config import RAGPipelineMode, Settings, TextRetrievalStrategy, load_settings
+from config import RAGPipelineMode, Settings, load_settings
 from text_tokenization import LexicalTokenizerConfig, tokenize_for_bm25
 
 
@@ -60,6 +61,7 @@ class AgentState(TypedDict):
     messages: List[BaseMessage]
     planner_memory: dict[str, Any]
     pending_tool_calls: list[dict[str, Any]]
+    completed_tool_results: list[dict[str, str]]
 
 
 def load_courses(path: Path) -> list[dict[str, str]]:
@@ -730,8 +732,7 @@ class CourseRetriever:
     C1 restricts to rows tagged ``course-content`` in ``documents.csv``; C6 to ``course=external-knowledge``.
     Other callers omit doc allowlists when searching planner or study-environment corpora.
 
-    Text ranking strategy is controlled by ``TEXT_RETRIEVAL_STRATEGY``
-    (``hybrid`` | ``dense_only`` | ``bm25_only``).
+    Text evidence always combines dense Chroma retrieval with BM25 via reciprocal rank fusion.
     RAG_MODE controls whether image retrieval/fusion is applied
     (multimodal_retrieval_mllm only) or text hits are returned directly.
     Optional course/week metadata filtering is applied via Chroma where and BM25 post-filter.
@@ -1003,7 +1004,7 @@ class CourseRetriever:
         enable_multimodal_fusion: bool | None = None,
         restrict_doc_ids: frozenset[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Run text retrieval per ``Settings.text_retrieval_strategy`` (from ``TEXT_RETRIEVAL_STRATEGY``).
+        """Run dense + BM25 text retrieval fused with RRF, then optional image fusion per ``rag_mode``.
 
         When ``restrict_doc_ids`` is set (e.g. C1 CourseQA), fused hits are limited to chunks whose
         ``doc_id`` is in ``documents.csv`` with that cohort (typically ``course-content`` tags).
@@ -1024,64 +1025,37 @@ class CourseRetriever:
             else:
                 dense_where = {"$and": [dense_where, doc_clause]}
 
-        strategy = self.settings.text_retrieval_strategy
         _trace_log(
-            "retrieval.search query=%r top_k=%d strategy=%s use_meta=%s eff_course=%r eff_week=%r "
+            "retrieval.search query=%r top_k=%d use_meta=%s eff_course=%r eff_week=%r "
             "restrict_doc_ids=%s where=%s",
             query,
             max(1, int(top_k)),
-            strategy.value,
             use_meta,
             eff_course,
             eff_week,
             None if restrict_doc_ids is None else len(restrict_doc_ids),
             where if where is not None else "none",
         )
-        dense_ids: list[str] = []
-        bm25_ids: list[str] = []
-        fused_scores: dict[str, float] = {}
-
-        if strategy == TextRetrievalStrategy.DENSE_ONLY:
-            dense_ids = self._dense_search(
-                query,
-                where=dense_where,
-                n_results=max(top_k, self.settings.dense_k),
-            )
-            _trace_log("retrieval.candidates dense_only count=%d dense_head=%s", len(dense_ids), dense_ids[:3])
-            for rank, chunk_id in enumerate(dense_ids, start=1):
-                fused_scores[chunk_id] = 1.0 / float(rank)
-        elif strategy == TextRetrievalStrategy.BM25_ONLY:
-            bm25_ids = self._bm25_search(
-                query=query,
-                course_filter=eff_course,
-                week_filter=eff_week,
-                n_results=max(top_k, self.settings.bm25_k),
-                restrict_doc_ids=restrict_doc_ids,
-            )
-            _trace_log("retrieval.candidates bm25_only count=%d bm25_head=%s", len(bm25_ids), bm25_ids[:3])
-            for rank, chunk_id in enumerate(bm25_ids, start=1):
-                fused_scores[chunk_id] = 1.0 / float(rank)
-        else:
-            dense_ids = self._dense_search(
-                query,
-                where=dense_where,
-                n_results=max(top_k, self.settings.dense_k),
-            )
-            bm25_ids = self._bm25_search(
-                query=query,
-                course_filter=eff_course,
-                week_filter=eff_week,
-                n_results=max(top_k, self.settings.bm25_k),
-                restrict_doc_ids=restrict_doc_ids,
-            )
-            _trace_log(
-                "retrieval.candidates hybrid dense=%d bm25=%d dense_head=%s bm25_head=%s",
-                len(dense_ids),
-                len(bm25_ids),
-                dense_ids[:3],
-                bm25_ids[:3],
-            )
-            fused_scores = _rrf_fuse(dense_ids, bm25_ids, k=max(1, self.settings.rrf_k))
+        dense_ids = self._dense_search(
+            query,
+            where=dense_where,
+            n_results=max(top_k, self.settings.dense_k),
+        )
+        bm25_ids = self._bm25_search(
+            query=query,
+            course_filter=eff_course,
+            week_filter=eff_week,
+            n_results=max(top_k, self.settings.bm25_k),
+            restrict_doc_ids=restrict_doc_ids,
+        )
+        _trace_log(
+            "retrieval.candidates dense_bm25_rrf dense=%d bm25=%d dense_head=%s bm25_head=%s",
+            len(dense_ids),
+            len(bm25_ids),
+            dense_ids[:3],
+            bm25_ids[:3],
+        )
+        fused_scores = _rrf_fuse(dense_ids, bm25_ids, k=max(1, self.settings.rrf_k))
 
         ranked_all = sorted(
             fused_scores.keys(),
@@ -1100,8 +1074,7 @@ class CourseRetriever:
                     continue
             text_hits.append(hit)
         _trace_log(
-            "retrieval.ranked strategy=%s kept=%s head_chunk_ids=%s",
-            strategy.value,
+            "retrieval.ranked kept=%s head_chunk_ids=%s",
             len(text_hits),
             [h.get("chunk_id") for h in text_hits[:3]],
         )
@@ -1142,7 +1115,7 @@ class CourseRetriever:
         """
         Retrieval over KB chunks whose indexed metadata ``course`` is ``external-knowledge`` (C6 Research QA).
 
-        Uses ``Settings.text_retrieval_strategy`` (``TEXT_RETRIEVAL_STRATEGY``). ``allowed_doc_ids``
+        Uses dense + BM25 fused with RRF over the external-knowledge course. ``allowed_doc_ids``
         further narrows to those ``doc_id`` values when non-``None``.
         """
         if allowed_doc_ids is not None and len(allowed_doc_ids) == 0:
@@ -1163,56 +1136,24 @@ class CourseRetriever:
             doc_clause = {"doc_id": {"$in": sorted(restrict_doc_ids)}}
             ext_where = {"$and": [ext_where, doc_clause]}
 
-        strategy = self.settings.text_retrieval_strategy
-        fused_scores: dict[str, float] = {}
-        dense_ids: list[str] = []
-        bm25_ids: list[str] = []
-
-        if strategy == TextRetrievalStrategy.DENSE_ONLY:
-            dense_ids = self._dense_search(
-                query, where=ext_where, n_results=max(top_k, self.settings.dense_k)
-            )
-            _trace_log(
-                "retrieval.external dense_only count=%d dense_head=%s",
-                len(dense_ids),
-                dense_ids[:3],
-            )
-            for rank, chunk_id in enumerate(dense_ids, start=1):
-                fused_scores[chunk_id] = 1.0 / float(rank)
-        elif strategy == TextRetrievalStrategy.BM25_ONLY:
-            bm25_ids = self._bm25_search(
-                query=query,
-                course_filter=KB_COURSE_EXTERNAL_KNOWLEDGE,
-                week_filter="",
-                n_results=max(top_k, self.settings.bm25_k),
-                restrict_doc_ids=restrict_doc_ids,
-            )
-            _trace_log(
-                "retrieval.external bm25_only count=%d bm25_head=%s",
-                len(bm25_ids),
-                bm25_ids[:3],
-            )
-            for rank, chunk_id in enumerate(bm25_ids, start=1):
-                fused_scores[chunk_id] = 1.0 / float(rank)
-        else:
-            dense_ids = self._dense_search(
-                query, where=ext_where, n_results=max(top_k, self.settings.dense_k)
-            )
-            bm25_ids = self._bm25_search(
-                query=query,
-                course_filter=KB_COURSE_EXTERNAL_KNOWLEDGE,
-                week_filter="",
-                n_results=max(top_k, self.settings.bm25_k),
-                restrict_doc_ids=restrict_doc_ids,
-            )
-            _trace_log(
-                "retrieval.external hybrid dense=%d bm25=%d dense_head=%s bm25_head=%s",
-                len(dense_ids),
-                len(bm25_ids),
-                dense_ids[:3],
-                bm25_ids[:3],
-            )
-            fused_scores = _rrf_fuse(dense_ids, bm25_ids, k=max(1, self.settings.rrf_k))
+        dense_ids = self._dense_search(
+            query, where=ext_where, n_results=max(top_k, self.settings.dense_k)
+        )
+        bm25_ids = self._bm25_search(
+            query=query,
+            course_filter=KB_COURSE_EXTERNAL_KNOWLEDGE,
+            week_filter="",
+            n_results=max(top_k, self.settings.bm25_k),
+            restrict_doc_ids=restrict_doc_ids,
+        )
+        _trace_log(
+            "retrieval.external dense_bm25_rrf dense=%d bm25=%d dense_head=%s bm25_head=%s",
+            len(dense_ids),
+            len(bm25_ids),
+            dense_ids[:3],
+            bm25_ids[:3],
+        )
+        fused_scores = _rrf_fuse(dense_ids, bm25_ids, k=max(1, self.settings.rrf_k))
 
         ranked_all = sorted(
             fused_scores.keys(),
@@ -1331,7 +1272,6 @@ def kb_course_retrieval(
             f"corpus_tags={KB_TAG_COURSE_CONTENT}",
             f"top_k={max(1, int(top_k))}",
             f"rag_mode={settings.rag_mode.value}",
-            f"retrieval_strategy={settings.text_retrieval_strategy.value}",
         ]
     )
     lines.append("Applied filters -> " + " | ".join(applied_parts))
@@ -1459,7 +1399,6 @@ def kb_external_research_retrieval(
         f" | paper_id_filter={pid or 'none'} | theme_hint={th or 'none'}"
         f" | top_k={max(1, int(top_k))}"
         f" | rag_mode={settings.rag_mode.value}"
-        f" | retrieval_strategy={settings.text_retrieval_strategy.value}"
     )
     image_paths: list[str] = []
     for rank, hit in enumerate(hits, start=1):
@@ -1741,7 +1680,6 @@ def _estimate_study_duration_mode(
     applied_parts = [
         f"metadata_filter={'on' if meta_on else 'off'}",
         f"mode={mode_name}",
-        f"retrieval_strategy={settings.text_retrieval_strategy.value}",
     ]
     if meta_on:
         applied_parts.append(f"course={resolved_course or 'none'}")
@@ -2043,7 +1981,7 @@ def _compute_free_slots_from_rows(
     lines = [
         "C3_FREE_SLOTS:",
         (
-            f"Applied filters -> mode={mode_name} | retrieval_strategy={settings.text_retrieval_strategy.value} | "
+            f"Applied filters -> mode={mode_name} | "
             f"week={resolved_week} | day={resolved_day or 'all'} | required_minutes={required} | day_bounds={day_start}-{day_end}"
         ),
     ]
@@ -2354,6 +2292,18 @@ def _run_study_environment_tool(
         else ("text_index+images" if mllm_understanding_on else "text_index_only")
     )
     llm_candidates = candidates[: max(3, min(8, int(top_k) * 2))]
+    recommendation_selection_rules = (
+        ""
+        if targeted_mode
+        else (
+            "Recommendation mode: choose environment_id by comparing the task_query to each candidate's "
+            "environment_type, coarse_geo, and retrieval evidence (and images when present). "
+            "Weigh tradeoffs (focus vs collaboration, quiet vs background noise, indoor screen work vs "
+            "outdoor/light movement, privacy, group work, exam conditions, etc.). "
+            "Do not default to private_study_room (env_03) or any single type—select it only when the task and "
+            "evidence clearly favor a quiet solo enclosed space. If another candidate is a better fit, pick that one.\n"
+        )
+    )
     llm_prompt = [
         SystemMessage(
             content=(
@@ -2361,6 +2311,7 @@ def _run_study_environment_tool(
                 "You only have sparse metadata (environment_type/coarse_geo) plus retrieval evidence.\n"
                 "Infer likely task fit factors (internet connection, natural light, interruptions, "
                 "noise, seating comfort) from available evidence. In multimodal mode, use image evidence when present.\n"
+                f"{recommendation_selection_rules}"
                 f"{image_grounding_guidance}"
                 "Return strict JSON only with keys:\n"
                 "- environment_id (must be one of the candidates)\n"
@@ -2542,7 +2493,8 @@ SYSTEM_PROMPT = SystemMessage(
         "If you use ``[filename.ext]`` evidence brackets, copy basenames only from retrieval ``source_file=`` lines.\n"
         "C2 DurationEstimator: estimate task minutes with estimate_study_duration.\n"
         "C3 FreeSlotFinder: find open schedule slots with find_free_slots.\n"
-        "C4 StudyEnvironmentRecommender: use recommend_study_environment to choose where to work.\n"
+        "C4 StudyEnvironmentRecommender: use recommend_study_environment to choose where to work. "
+        "Match the task to environment characteristics; there is no single best place for every task.\n"
         "C5 StudyEnvironmentFit: use assess_study_environment_fit to judge a specific environment for a task.\n"
         "Respect dataset week tags like week-01..week-07 and easter-week.\n"
         "Routing rules:\n"
@@ -2563,34 +2515,32 @@ SYSTEM_PROMPT = SystemMessage(
 
 
 def _build_llm(settings: Settings):
-    """Create Gemini backend and bind available tools."""
-    from langchain_google_genai import ChatGoogleGenerativeAI
+    """Create OpenAI backend and bind available tools."""
+    from langchain_openai import ChatOpenAI
 
-    if not settings.gemini_api_key:
+    if not settings.openai_api_key:
         raise ValueError(
-            "Gemini API key is missing. Set GOOGLE_API_KEY."
+            "OpenAI API key is missing. Set OPENAI_API_KEY."
         )
-    return ChatGoogleGenerativeAI(
-        model=settings.gemini_model,
+    return ChatOpenAI(
+        model=settings.openai_model,
         temperature=0,
-        api_key=settings.gemini_api_key,
-        convert_system_message_to_human=True,
+        api_key=settings.openai_api_key,
     ).bind_tools(TOOLS)
 
 
 def _build_reasoning_llm(settings: Settings):
-    """Create a plain Gemini client without bound tools."""
-    from langchain_google_genai import ChatGoogleGenerativeAI
+    """Create a plain OpenAI client without bound tools."""
+    from langchain_openai import ChatOpenAI
 
-    if not settings.gemini_api_key:
+    if not settings.openai_api_key:
         raise ValueError(
-            "Gemini API key is missing. Set GOOGLE_API_KEY."
+            "OpenAI API key is missing. Set OPENAI_API_KEY."
         )
-    return ChatGoogleGenerativeAI(
-        model=settings.gemini_model,
+    return ChatOpenAI(
+        model=settings.openai_model,
         temperature=0,
-        api_key=settings.gemini_api_key,
-        convert_system_message_to_human=True,
+        api_key=settings.openai_api_key,
     )
 
 
@@ -2621,6 +2571,15 @@ def _latest_user_text(messages: list[BaseMessage]) -> str:
             if text:
                 return text
     return ""
+
+
+def _active_user_query(state: AgentState) -> str:
+    """Latest user text, falling back to memory when ToolNode has replaced message history."""
+    direct = _latest_user_text(state.get("messages", []))
+    if direct:
+        return direct
+    mem = _get_planner_memory(state)
+    return str(mem.get("active_user_query", "")).strip()
 
 
 def _extract_image_paths(tool_result: str) -> list[str]:
@@ -2797,7 +2756,7 @@ def _build_planner_memory_patch(
     rc = str(call_args.get("course_filter", "")).strip().lower()
     rw = str(call_args.get("week_filter", "")).strip().lower()
     rd = str(call_args.get("day_filter", "")).strip().lower()
-    return {
+    patch: dict[str, Any] = {
         "capability": _CAPABILITY_BY_TOOL.get(tool_name, ""),
         "last_tool_name": tool_name,
         "last_tool_summary": _truncate_for_log(tool_result, 240),
@@ -2805,6 +2764,11 @@ def _build_planner_memory_patch(
         "resolved_week": rw or parsed["resolved_week"],
         "resolved_day": rd or parsed["resolved_day"],
     }
+    if tool_name == "estimate_study_duration":
+        minutes = _required_minutes_from_text(tool_result)
+        if minutes > 0:
+            patch["last_estimated_minutes"] = minutes
+    return patch
 
 
 def _c3_has_time_anchor(
@@ -3183,15 +3147,275 @@ def _tool_calls_dict_list(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _tool_messages_since_latest_user(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Tool outputs produced for the current user turn, in transcript order."""
+    start = 0
+    for index in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[index], HumanMessage):
+            start = index + 1
+            break
+    return [m for m in messages[start:] if getattr(m, "type", None) == "tool"]
+
+
+def _completed_tool_results(state: AgentState) -> list[dict[str, str]]:
+    """Completed tool transcripts carried outside LangGraph's message replacement semantics."""
+    output: list[dict[str, str]] = []
+    for item in state.get("completed_tool_results") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        content = str(item.get("content", "")).strip()
+        if name and content:
+            output.append({"name": name, "content": content})
+    return output
+
+
+def _required_minutes_from_text(content: str) -> int:
+    """Extract a C2 estimate from a tool transcript."""
+    match = re.search(r"(?m)^REQUIRED_MINUTES=(\d+)\s*$", content)
+    if match:
+        return _safe_int(match.group(1), 0)
+    estimate_payload = _json_assigned_on_line(content, "ESTIMATE_JSON")
+    if isinstance(estimate_payload, dict):
+        minutes = _safe_int(estimate_payload.get("estimated_minutes"), 0)
+        if minutes > 0:
+            return minutes
+    return 0
+
+
+def _latest_required_minutes(messages: list[BaseMessage]) -> int:
+    """Most recent REQUIRED_MINUTES value from completed tool transcripts."""
+    for message in reversed(messages):
+        if getattr(message, "type", None) != "tool":
+            continue
+        minutes = _required_minutes_from_text(str(message.content))
+        if minutes > 0:
+            return minutes
+    return 0
+
+
+def _latest_required_minutes_from_completed(completed: list[dict[str, str]]) -> int:
+    """Most recent C2 estimate from completed tool transcripts stored in state."""
+    for item in reversed(completed):
+        if item.get("name") != "estimate_study_duration":
+            continue
+        minutes = _required_minutes_from_text(str(item.get("content", "")))
+        if minutes > 0:
+            return minutes
+    return 0
+
+
+def _minutes_requested_in_query(user_query: str) -> int:
+    """Extract a simple duration hint from user text for C3 when no C2 result exists yet."""
+    normalized = _normalize_for_match(user_query)
+    hour_match = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:hour|hours|hr|hrs|h)\b", normalized)
+    if hour_match:
+        try:
+            return max(1, int(float(hour_match.group(1)) * 60))
+        except ValueError:
+            pass
+    minute_match = re.search(r"\b(\d{1,4})\s*(?:minute|minutes|min|mins|m)\b", normalized)
+    if minute_match:
+        return max(1, _safe_int(minute_match.group(1), 60))
+    return 0
+
+
+def _make_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Create a LangChain-compatible tool call dict for deterministic queue fallback."""
+    return {
+        "name": name,
+        "args": args,
+        "id": f"call_planner_{uuid.uuid4().hex[:16]}",
+        "type": "tool_call",
+    }
+
+
+def _infer_requested_tool_names(user_query: str) -> list[str]:
+    """Heuristic fallback for obvious multi-capability requests in one user message."""
+    normalized = _normalize_for_match(user_query)
+    if not normalized:
+        return []
+
+    requested: list[str] = []
+
+    def add(name: str) -> None:
+        if name not in requested:
+            requested.append(name)
+
+    if re.search(r"\b(how long|duration|estimate|take|time needed|study time)\b", normalized):
+        add("estimate_study_duration")
+    if re.search(r"\b(free slot|free slots|available|availability|when can|find time|fit .*in|schedule)\b", normalized):
+        add("find_free_slots")
+    if re.search(r"\b(where|place|environment|location|room|space)\b", normalized) and re.search(
+        r"\b(study|work|do|complete|revise|review|focus)\b", normalized
+    ):
+        add("recommend_study_environment")
+    if re.search(r"\b(good idea|suitable|fit|appropriate|okay|ok)\b", normalized) and re.search(
+        r"\b(in|at)\b", normalized
+    ):
+        if "recommend_study_environment" in requested:
+            requested.remove("recommend_study_environment")
+        add("assess_study_environment_fit")
+    research_request = bool(
+        re.search(
+            r"\b(research-backed|evidence-based|learning science|study technique|spaced|retrieval practice|recall|habit|breaks|fatigue|prioriti[sz]|cognitive load)\b",
+            normalized,
+        )
+        or (
+            re.search(r"\b(research|evidence)\b", normalized)
+            # Avoid false positives when the user mentions the "operations-research" course name.
+            # `_normalize_for_match()` preserves hyphens, so match both "operations research" and "operations-research".
+            and not re.search(r"\boperations[\s-]?research\b", normalized)
+            and re.search(r"\b(advice|recommend|strategy|strategies|why|effective|better|guidance)\b", normalized)
+        )
+    )
+    explicit_course_material_request = bool(
+        re.search(
+            r"\b(covered|lecture|lectures|slides|course material|course materials|summarize)\b",
+            normalized,
+        )
+        or re.search(r"\b(course|week|lecture|slide|material|covered)\s+topics?\b", normalized)
+        or re.search(r"\btopics?\s+(covered|in\s+(?:the\s+)?(?:course|week|lecture|slides?|materials?))\b", normalized)
+    )
+    if explicit_course_material_request:
+        add("kb_course_retrieval")
+    if research_request:
+        add("kb_external_research_retrieval")
+
+    priority = {
+        "kb_course_retrieval": 10,
+        "kb_external_research_retrieval": 20,
+        "estimate_study_duration": 30,
+        "find_free_slots": 40,
+        "recommend_study_environment": 50,
+        "assess_study_environment_fit": 50,
+    }
+    return sorted(requested, key=lambda name: priority.get(name, 999))
+
+
+def _default_tool_call_for_name(name: str, user_query: str, messages: list[BaseMessage]) -> dict[str, Any]:
+    """Build conservative arguments for a missing tool in a detected multi-tool query."""
+    settings = get_settings()
+    week = _detect_week_filter(user_query)
+    day = _detect_day_filter(user_query)
+    course = _detect_course_filter(user_query)
+
+    if name == "kb_course_retrieval":
+        args: dict[str, Any] = {"query": user_query, "top_k": max(1, settings.hybrid_k)}
+        if course:
+            args["course_filter"] = course
+        if week:
+            args["week_filter"] = week
+        return _make_tool_call(name, args)
+    if name == "kb_external_research_retrieval":
+        args = {"query": user_query, "top_k": max(1, settings.hybrid_k)}
+        paper_id = _c6_paper_id_to_force(user_query)
+        if paper_id:
+            args["paper_id"] = paper_id
+        return _make_tool_call(name, args)
+    if name == "estimate_study_duration":
+        args = {"task_query": user_query, "query": user_query}
+        if course:
+            args["course_filter"] = course
+        if week:
+            args["week_filter"] = week
+        if day:
+            args["day_filter"] = day
+        return _make_tool_call(name, args)
+    if name == "find_free_slots":
+        required = _latest_required_minutes(messages) or _minutes_requested_in_query(user_query) or 60
+        args = {
+            "week_filter": week,
+            "day_filter": day,
+            "required_minutes": required,
+        }
+        return _make_tool_call(name, args)
+    if name == "assess_study_environment_fit":
+        return _make_tool_call(name, {"task_query": user_query, "query": user_query, "environment_hint": user_query})
+    return _make_tool_call(name, {"task_query": user_query, "query": user_query})
+
+
+def _augment_tool_calls_for_multi_intent(
+    tool_calls: list[dict[str, Any]],
+    user_query: str,
+    messages: list[BaseMessage],
+) -> list[dict[str, Any]]:
+    """Append deterministic missing tool calls when the user clearly asked for several capabilities."""
+    inferred = _infer_requested_tool_names(user_query)
+    if len(inferred) <= 1:
+        return tool_calls
+    existing = [str(call.get("name", "")).strip() for call in tool_calls if isinstance(call, dict)]
+    augmented = list(tool_calls)
+    for name in inferred:
+        if name in existing:
+            continue
+        augmented.append(_default_tool_call_for_name(name, user_query, messages))
+        existing.append(name)
+    if len(augmented) > len(tool_calls):
+        logging.getLogger(__name__).info(
+            "sequential_tools augmented_missing=%s",
+            [name for name in existing if name not in [str(c.get("name", "")).strip() for c in tool_calls]],
+        )
+    return augmented
+
+
+def _normalize_deferred_tool_call_args(
+    call: dict[str, Any],
+    user_query: str,
+    messages: list[BaseMessage],
+    completed_tool_results: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Fill args whose values are only known after previous sequential tools have run."""
+    name = str(call.get("name", "")).strip()
+    args = dict(call.get("args") or {})
+    if name == "find_free_slots":
+        incoming_required = _safe_int(args.get("required_minutes", 0), 0)
+        message_estimated_required = _latest_required_minutes(messages)
+        completed_estimated_required = _latest_required_minutes_from_completed(completed_tool_results or [])
+        estimated_required = completed_estimated_required or message_estimated_required
+        query_required = _minutes_requested_in_query(user_query)
+        if not str(args.get("week_filter", "")).strip():
+            args["week_filter"] = _detect_week_filter(user_query)
+        if not str(args.get("day_filter", "")).strip():
+            detected_day = _detect_day_filter(user_query)
+            if detected_day:
+                args["day_filter"] = detected_day
+        if estimated_required > 0:
+            args["required_minutes"] = estimated_required
+        elif incoming_required <= 0:
+            args["required_minutes"] = query_required or 60
+        logging.getLogger(__name__).info(
+            "sequential_tools c3_duration_handoff incoming_required=%s "
+            "message_estimate_required=%s completed_estimate_required=%s "
+            "latest_estimate_required=%s query_required=%s final_required=%s "
+            "week_filter=%r day_filter=%r",
+            incoming_required,
+            message_estimated_required,
+            completed_estimated_required,
+            estimated_required,
+            query_required,
+            args.get("required_minutes"),
+            args.get("week_filter", ""),
+            args.get("day_filter", ""),
+        )
+    if name in {"estimate_study_duration", "recommend_study_environment", "assess_study_environment_fit"}:
+        if not str(args.get("task_query", "")).strip() and not str(args.get("query", "")).strip():
+            args["task_query"] = user_query
+            args["query"] = user_query
+    if name in {"kb_course_retrieval", "kb_external_research_retrieval"} and not str(args.get("query", "")).strip():
+        args["query"] = user_query
+    return {**call, "args": args}
+
+
 def agent_node(state: AgentState):
     """LLM node: routes tool calls and composes final C1–C6 responses."""
     messages = state["messages"]
-    user_query = _latest_user_text(messages)
+    user_query = _active_user_query(state)
+    routing_turn = not (messages and getattr(messages[-1], "type", None) == "tool")
     _trace_log("agent_node enter last_message_type=%s user_query=%r", getattr(messages[-1], "type", "unknown"), user_query)
 
     if messages and getattr(messages[-1], "type", None) == "tool":
         settings = get_settings()
-        non_tool_messages = [m for m in messages if getattr(m, "type", None) != "tool"]
         tm = messages[-1]
         tool_name = str(getattr(tm, "name", "")).strip()
         tool_result = str(tm.content)
@@ -3202,13 +3426,63 @@ def agent_node(state: AgentState):
             _truncate_for_log(tool_result, 180),
         )
 
-        if tool_name == "estimate_study_duration":
+        current_tool_records = _completed_tool_results(state)
+        current_tool_messages = _tool_messages_since_latest_user(messages)
+        if len(current_tool_records) > 1:
+            tool_sections: list[str] = []
+            for index, tool_record in enumerate(current_tool_records, start=1):
+                name = str(tool_record.get("name", "unknown_tool")).strip()
+                content = str(tool_record.get("content", ""))
+                tool_sections.append(f"TOOL_{index} name={name}\n{content}")
+            prompt_messages = [
+                SystemMessage(
+                    content=(
+                        "Produce one concise answer that integrates every completed planner tool result.\n"
+                        "Use a short section for each distinct user need in the same order the tools ran.\n"
+                        "Do not ignore earlier tool outputs just because a later tool ran. "
+                        "Ground claims only in the provided tool transcripts."
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        f'User request: "{user_query}"\n\n'
+                        "Completed tool transcripts:\n\n"
+                        + "\n\n".join(tool_sections)
+                    )
+                ),
+            ]
+        elif len(current_tool_messages) > 1:
+            tool_sections = []
+            for index, tool_message in enumerate(current_tool_messages, start=1):
+                name = str(getattr(tool_message, "name", "") or "unknown_tool").strip()
+                content = str(tool_message.content)
+                if tool_message is tm and tool_result != content:
+                    content = tool_result
+                tool_sections.append(f"TOOL_{index} name={name}\n{content}")
+            prompt_messages = [
+                SystemMessage(
+                    content=(
+                        "Produce one concise answer that integrates every completed planner tool result.\n"
+                        "Use a short section for each distinct user need in the same order the tools ran.\n"
+                        "Do not ignore earlier tool outputs just because a later tool ran. "
+                        "Ground claims only in the provided tool transcripts."
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        f'User request: "{user_query}"\n\n'
+                        "Completed tool transcripts:\n\n"
+                        + "\n\n".join(tool_sections)
+                    )
+                ),
+            ]
+        elif tool_name == "estimate_study_duration":
             c2_payload = (
                 f'User request: "{user_query}"\n\n'
                 "Duration estimate:\n"
                 f"{tool_result}"
             )
-            prompt_messages = non_tool_messages + [
+            prompt_messages = [
                 SystemMessage(
                     content=(
                         "Produce a concise C2 duration estimate answer.\n"
@@ -3225,7 +3499,7 @@ def agent_node(state: AgentState):
                 "Free slots:\n"
                 f"{tool_result}"
             )
-            prompt_messages = non_tool_messages + [
+            prompt_messages = [
                 SystemMessage(
                     content=(
                         "Produce a concise C3 slot-finder answer.\n"
@@ -3265,7 +3539,7 @@ def agent_node(state: AgentState):
                 c4_user_payload = multimodal_content
             else:
                 c4_user_payload = c4_payload_text
-            prompt_messages = non_tool_messages + [
+            prompt_messages = [
                 SystemMessage(
                     content=(
                         (
@@ -3284,7 +3558,10 @@ def agent_node(state: AgentState):
                             "- Optional caveat if confidence is not high."
                             if targeted_mode
                             else
-                            "If assessment_mode is recommendation, select exactly one environment from the evidence.\n"
+                            "If assessment_mode is recommendation, select exactly one environment from the evidence by "
+                            "comparing the user's request to each option's type, location, and evidence (and images if present). "
+                            "Do not always recommend the private study room (env_03); pick the environment that best matches "
+                            "the task (e.g. collaboration vs solo focus, noise tolerance, need for quiet, outdoor/light breaks).\n"
                             "Output format:\n"
                             "- Recommended environment: environment_id and a short label\n"
                             "- Why it fits: 1-2 short bullets grounded in factors "
@@ -3365,7 +3642,7 @@ def agent_node(state: AgentState):
                     "from the retrieved lines above (same spelling and punctuation). Do not bracket any other "
                     "filename or invented short name; if none apply, omit bracket tags."
                 )
-            prompt_messages = non_tool_messages + [
+            prompt_messages = [
                 SystemMessage(content=retrieval_guide),
                 HumanMessage(content=user_payload),
             ]
@@ -3379,6 +3656,11 @@ def agent_node(state: AgentState):
     response = get_llm().invoke(prompt_messages)
     if getattr(response, "tool_calls", None):
         response = _aimessage_with_forced_c6_paper_id(response, user_query)
+    tcalls = _tool_calls_dict_list(getattr(response, "tool_calls", None))
+    if routing_turn:
+        tcalls = _augment_tool_calls_for_multi_intent(tcalls, user_query, messages)
+        if tcalls:
+            response = AIMessage(content="", tool_calls=tcalls)
     if getattr(response, "tool_calls", None):
         tool_names = [str(call.get("name", "")).strip() for call in response.tool_calls if isinstance(call, dict)]
         logging.getLogger(__name__).info(
@@ -3396,7 +3678,7 @@ def agent_node(state: AgentState):
         if trailing is not None and str(getattr(trailing, "name", "")).strip() in (
             "kb_course_retrieval",
             "kb_external_research_retrieval",
-        ):
+        ) and len(_tool_messages_since_latest_user(messages)) <= 1:
             answer_text = _render_assistant_content(response.content)
             if not _bracket_file_citations_match_retrieval(answer_text, str(trailing.content)):
                 response = AIMessage(
@@ -3412,6 +3694,9 @@ def agent_node(state: AgentState):
     _log_missing_required_tool_args(getattr(response, "tool_calls", None))
 
     out: dict[str, Any] = {"messages": messages + [response]}
+    if routing_turn:
+        out["planner_memory"] = {**_get_planner_memory(state), "active_user_query": user_query}
+        out["completed_tool_results"] = []
     tcalls = _tool_calls_dict_list(getattr(response, "tool_calls", None))
     if len(tcalls) > 1:
         first = tcalls[0]
@@ -3438,6 +3723,13 @@ def deferred_tools_node(state: AgentState) -> dict[str, Any]:
     if not isinstance(head, dict) or not str(head.get("name", "")).strip():
         logging.getLogger(__name__).warning("deferred_tools skipping invalid queue head")
         return {"pending_tool_calls": rest}
+    user_query = _active_user_query(state)
+    head = _normalize_deferred_tool_call_args(
+        head,
+        user_query,
+        state["messages"],
+        completed_tool_results=_completed_tool_results(state),
+    )
     synthetic = AIMessage(content="", tool_calls=[head])
     logging.getLogger(__name__).info(
         "sequential_tools deferred name=%s remaining_in_queue=%d",
@@ -3463,7 +3755,7 @@ def verifier_node(state: AgentState):
 
     tool_name = str(getattr(messages[-1], "name", "")).strip()
     tool_result = str(messages[-1].content)
-    user_query = _latest_user_text(messages)
+    user_query = _active_user_query(state)
     # Run KB auto-retry here (before weak checks) so recovery is not skipped when
     # the transcript would otherwise fail weak_markers in _tool_output_is_weak.
     retried = _kb_tool_result_after_retry(
@@ -3489,6 +3781,9 @@ def verifier_node(state: AgentState):
     call_args = _tool_call_args_for_tool_message(messages, messages[-1])
     mem_patch = _build_planner_memory_patch(tool_name, tool_result, call_args)
     merged_memory = {**_get_planner_memory(state), **mem_patch}
+    completed = _completed_tool_results(state) + [
+        {"name": tool_name, "content": tool_result}
+    ]
 
     is_weak, reason = _tool_output_is_weak(
         tool_name,
@@ -3503,13 +3798,24 @@ def verifier_node(state: AgentState):
         reason or "ok",
     )
     if not is_weak:
-        return {"messages": messages, "planner_memory": merged_memory}
+        logging.getLogger(__name__).info(
+            "sequential_tools completed_tool_results count=%d names=%s latest_estimate_required=%s",
+            len(completed),
+            [item.get("name", "") for item in completed],
+            _latest_required_minutes_from_completed(completed),
+        )
+        return {
+            "messages": messages,
+            "planner_memory": merged_memory,
+            "completed_tool_results": completed,
+        }
 
     question = _clarifying_question_for_tool(tool_name, reason)
     return {
         "messages": messages + [AIMessage(content=question)],
         "planner_memory": merged_memory,
         "pending_tool_calls": [],
+        "completed_tool_results": completed,
     }
 
 
@@ -3595,8 +3901,8 @@ if __name__ == "__main__":
         if user_text.lower() in {"exit", "quit"}:
             break
         if not user_text:
-            # Empty line would create HumanMessage("") which LangChain drops; Gemini then
-            # receives no `contents` and raises ValueError: contents are required.
+            # Empty line would create HumanMessage("") which LangChain drops; providers
+            # may reject requests with no user content.
             continue
 
         result = app.invoke(
@@ -3607,6 +3913,7 @@ if __name__ == "__main__":
                 ],
                 "planner_memory": dict(session_memory),
                 "pending_tool_calls": [],
+                "completed_tool_results": [],
             }
         )
         merged = result.get("planner_memory")

@@ -14,22 +14,14 @@ class RAGPipelineMode(str, Enum):
     MULTIMODAL_RETRIEVAL_MLLM = "multimodal_retrieval_mllm"
 
 
-class TextRetrievalStrategy(str, Enum):
-    """Supported text retrieval strategies (``TEXT_RETRIEVAL_STRATEGY``)."""
-    HYBRID = "hybrid"
-    DENSE_ONLY = "dense_only"
-    BM25_ONLY = "bm25_only"
-
-
 @dataclass(frozen=True)
 class Settings:
     """Runtime settings for the planner agent."""
-    gemini_model: str
-    gemini_api_key: str | None
+    openai_model: str
+    openai_api_key: str | None
 
     # Retrieval
     rag_mode: RAGPipelineMode
-    text_retrieval_strategy: TextRetrievalStrategy
     open_clip_model: str
     open_clip_pretrained: str
     text_collection_name: str
@@ -52,9 +44,8 @@ class Settings:
 
 
 DEFAULTS = {
-    "GEMINI_MODEL": "gemini-3.1-flash-lite",
+    "OPENAI_MODEL": "gpt-5.4-mini",
     "PLANNER_RAG_MODE": RAGPipelineMode.TEXT_RETRIEVAL_MLLM.value,
-    "TEXT_RETRIEVAL_STRATEGY": TextRetrievalStrategy.HYBRID.value,
     "OPEN_CLIP_MODEL": "ViT-B-32",
     "OPEN_CLIP_PRETRAINED": "laion2b_s34b_b79k",
     "TEXT_COLLECTION_NAME": "text_chunks",
@@ -122,20 +113,14 @@ def load_settings() -> Settings:
         RAGPipelineMode,
         DEFAULTS["PLANNER_RAG_MODE"],
     )
-    text_retrieval_strategy = _enum_env(
-        "TEXT_RETRIEVAL_STRATEGY",
-        TextRetrievalStrategy,
-        DEFAULTS["TEXT_RETRIEVAL_STRATEGY"],
-    )
     text_context_mode = _str_env("TEXT_CONTEXT_MODE").lower()
     if text_context_mode not in {"none", "metadata"}:
         text_context_mode = str(DEFAULTS["TEXT_CONTEXT_MODE"])
 
     return Settings(
-        gemini_model=_str_env("GEMINI_MODEL"),
-        gemini_api_key=(os.environ.get("GOOGLE_API_KEY") or "").strip() or None,
+        openai_model=_str_env("OPENAI_MODEL"),
+        openai_api_key=(os.environ.get("OPENAI_API_KEY") or "").strip() or None,
         rag_mode=rag_mode,
-        text_retrieval_strategy=text_retrieval_strategy,
         open_clip_model=_str_env("OPEN_CLIP_MODEL"),
         open_clip_pretrained=_str_env("OPEN_CLIP_PRETRAINED"),
         text_collection_name=_str_env("TEXT_COLLECTION_NAME"),
