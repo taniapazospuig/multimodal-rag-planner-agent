@@ -5,7 +5,7 @@ Minimal planner agent with six capability labels:
 - C3 FreeSlotFinder (find open slots in a target week/day)
 - C4 StudyEnvironmentRecommender (suggest where to do a task)
 - C5 StudyEnvironmentFit (judge a specific environment for a task)
-- C6 ResearchQA (docs tagged ``evidence`` only, via kb_external_research_retrieval)
+- C6 ResearchQA (``course=external-knowledge`` KB only, via kb_external_research_retrieval)
 
 This module intentionally reuses already-built retrieval artifacts:
 - Chroma DB in `chroma_db` (dense index)
@@ -17,6 +17,7 @@ It does not perform indexing or backfill at runtime.
 from __future__ import annotations
 
 import base64
+import copy
 import csv
 import json
 import logging
@@ -25,7 +26,7 @@ import warnings
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, List, TypedDict
+from typing import Any, List, TypedDict
 
 import chromadb
 import open_clip
@@ -34,11 +35,11 @@ from rank_bm25 import BM25Okapi
 from urllib3.exceptions import NotOpenSSLWarning
 
 from langchain.tools import tool
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from config import LLMBackend, RAGPipelineMode, Settings, TextRetrievalStrategy, load_settings
+from config import RAGPipelineMode, Settings, TextRetrievalStrategy, load_settings
 from text_tokenization import LexicalTokenizerConfig, tokenize_for_bm25
 
 
@@ -58,6 +59,7 @@ class AgentState(TypedDict):
 
     messages: List[BaseMessage]
     planner_memory: dict[str, Any]
+    pending_tool_calls: list[dict[str, Any]]
 
 
 def load_courses(path: Path) -> list[dict[str, str]]:
@@ -106,7 +108,7 @@ def get_document_rows() -> list[dict[str, str]]:
 
 
 KB_TAG_COURSE_CONTENT = "course-content"
-KB_TAG_EVIDENCE = "evidence"
+KB_COURSE_EXTERNAL_KNOWLEDGE = "external-knowledge"
 
 
 _DOC_IDS_BY_TAG_CACHE: dict[str, frozenset[str]] = {}
@@ -249,6 +251,19 @@ def get_settings() -> Settings:
     return _SETTINGS
 
 
+def _ablation_uses_multimodal_retrieval(rag_mode: RAGPipelineMode) -> bool:
+    """Whether retrieval should use image-index signals in this ablation mode."""
+    return rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM
+
+
+def _ablation_uses_multimodal_understanding(rag_mode: RAGPipelineMode) -> bool:
+    """Whether answer understanding should include image inputs in this ablation mode."""
+    return rag_mode in {
+        RAGPipelineMode.TEXT_RETRIEVAL_MLLM,
+        RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM,
+    }
+
+
 def _trace_log(message: str, *args: Any) -> None:
     """Emit verbose pipeline trace logs when DEBUG_TRACE_ENABLED is set."""
     if get_settings().debug_trace_enabled:
@@ -308,20 +323,22 @@ def _c6_is_single_paper_user_query(user_query: str) -> bool:
     return len(_c6_ordered_extp_ids(user_query)) == 1
 
 
-def _c6_allowed_source_files(tool_result: str) -> set[str]:
+def _retrieval_allowed_source_files(tool_result: str) -> set[str]:
+    """Filenames from ``source_file=`` lines in a kb_course_retrieval / kb_external_research_retrieval blob."""
     return set(re.findall(r"source_file=(\S+)", tool_result))
 
 
-def _c6_bracket_pdf_citations(answer_text: str) -> list[str]:
-    return re.findall(r"\[([^\]\n]+\.pdf)\]", answer_text, flags=re.IGNORECASE)
+def _bracket_file_citations(answer_text: str) -> list[str]:
+    """Bracketed ``[name.ext]`` spans that look like filenames (one extension dot; no path slashes)."""
+    return re.findall(r"\[([^\]\n/]+\.[^\]\n/]+)\]", answer_text)
 
 
-def _c6_final_citations_match_retrieval(answer_text: str, tool_result: str) -> bool:
-    """Every [...pdf] in the answer must exactly match a source_file= from this retrieval blob."""
-    cited = _c6_bracket_pdf_citations(answer_text)
+def _bracket_file_citations_match_retrieval(answer_text: str, tool_result: str) -> bool:
+    """Every such bracketed filename in the answer must exactly match a source_file= from this blob (C1/C6)."""
+    cited = _bracket_file_citations(answer_text)
     if not cited:
         return True
-    allowed = _c6_allowed_source_files(tool_result)
+    allowed = _retrieval_allowed_source_files(tool_result)
     return all(c in allowed for c in cited)
 
 
@@ -572,11 +589,18 @@ def _normalize_day_filter(value: str) -> str:
     return DAY_TO_ABBR.get(normalized, "")
 
 
-def _resolve_week_filter(raw_week_filter: str, query: str = "") -> str:
-    """Resolve week filter from explicit input or query text."""
+def _resolve_week_filter(
+    raw_week_filter: str,
+    query: str = "",
+    *,
+    infer_from_query: bool = True,
+) -> str:
+    """Resolve week filter from explicit tool input; optionally infer from query text."""
     candidate = _canonicalize_week_filter(raw_week_filter, allow_bare_number=True)
     if candidate:
         return candidate
+    if not infer_from_query:
+        return ""
     return _detect_week_filter(query)
 
 def _parse_hhmm_to_minutes(value: str) -> int | None:
@@ -703,7 +727,7 @@ def _rrf_fuse(dense_ranked_ids: list[str], bm25_ranked_ids: list[str], k: int) -
 class CourseRetriever:
     """
     Unified retrieval over indexed ``text_chunks`` + BM25 (and planner_images fusion where configured).
-    C1 restricts to rows tagged ``course-content`` in ``documents.csv``; C6 to ``evidence``.
+    C1 restricts to rows tagged ``course-content`` in ``documents.csv``; C6 to ``course=external-knowledge``.
     Other callers omit doc allowlists when searching planner or study-environment corpora.
 
     Text ranking strategy is controlled by ``TEXT_RETRIEVAL_STRATEGY``
@@ -830,40 +854,6 @@ class CourseRetriever:
             output.append(str(row.get("chunk_id", "")))
         return [chunk_id for chunk_id in output if chunk_id]
 
-    def _bm25_search_with_predicate(
-        self,
-        query: str,
-        n_results: int,
-        row_predicate: Callable[[dict[str, Any]], bool],
-    ) -> list[str]:
-        """BM25 retrieval restricted to corpus rows whose metadata passes ``row_predicate``."""
-        if self.bm25 is None or not self.bm25_rows:
-            return []
-
-        tokens = tokenize_for_bm25(query, self.lexical_tokenizer_config)
-        if not tokens:
-            return []
-
-        scores = self.bm25.get_scores(tokens)
-        ranked_indices = sorted(
-            range(len(scores)),
-            key=lambda index: float(scores[index]),
-            reverse=True,
-        )
-
-        output: list[str] = []
-        for index in ranked_indices:
-            if len(output) >= max(1, n_results):
-                break
-            row = self.bm25_rows[index]
-            meta = row.get("metadata", {}) or {}
-            if not row_predicate(meta):
-                continue
-            cid = str(row.get("chunk_id", "")).strip()
-            if cid:
-                output.append(cid)
-        return output
-
     def _hydrate_hit(self, chunk_id: str, score: float) -> dict[str, Any]:
         """Materialize a fused hit from BM25 rows, or fallback to Chroma documents."""
         row = self.by_id.get(chunk_id)
@@ -966,12 +956,17 @@ class CourseRetriever:
         return fused_hits
 
     def search_planner_images(self, query: str, top_k: int, week_filter: str) -> list[str]:
-        """Retrieve planner screenshot image paths for C3 multimodal extraction."""
+        """Retrieve planner screenshot image paths for C3 multimodal extraction.
+
+        Week is added to the Chroma ``where`` clause only when
+        ``Settings.retrieval_metadata_filter_enabled`` is true.
+        """
         if self.image_collection.count() <= 0:
             return []
-        where = {"$and": [{"course": "personal-planner"}, {"resource_type": "planner_screenshot"}]}
-        if week_filter:
-            where["$and"].append({"week": week_filter})
+        use_week_meta = self.settings.retrieval_metadata_filter_enabled
+        where: dict[str, Any] = {"course": "personal-planner"}
+        if week_filter and use_week_meta:
+            where = {"$and": [{"course": "personal-planner"}, {"week": week_filter}]}
         query_embedding = self.backbone.encode_text([query])[0]
         try:
             results = self.image_collection.query(
@@ -1145,37 +1140,28 @@ class CourseRetriever:
         enable_multimodal_fusion: bool | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Retrieval over KB chunks whose ``documents.csv`` ``tags`` value is ``evidence`` (C6 Research QA).
+        Retrieval over KB chunks whose indexed metadata ``course`` is ``external-knowledge`` (C6 Research QA).
 
         Uses ``Settings.text_retrieval_strategy`` (``TEXT_RETRIEVAL_STRATEGY``). ``allowed_doc_ids``
-        further narrows to a subset when non-``None`` (intersected with evidence docs).
+        further narrows to those ``doc_id`` values when non-``None``.
         """
         if allowed_doc_ids is not None and len(allowed_doc_ids) == 0:
             return []
 
-        evidence_docs = get_doc_ids_with_tag(KB_TAG_EVIDENCE)
-        if not evidence_docs:
-            return []
-
-        restrict_docs: frozenset[str] | None
+        restrict_doc_ids: frozenset[str] | None
         if allowed_doc_ids is not None:
-            restrict_docs = frozenset(doc for doc in allowed_doc_ids if doc in evidence_docs)
-            if not restrict_docs:
+            restrict_doc_ids = frozenset(
+                doc for doc in allowed_doc_ids if str(doc).strip()
+            )
+            if not restrict_doc_ids:
                 return []
-            dense_where_ids = sorted(restrict_docs)
         else:
-            restrict_docs = None
-            dense_where_ids = sorted(evidence_docs)
+            restrict_doc_ids = None
 
-        ext_where: dict[str, Any] = {"doc_id": {"$in": dense_where_ids}}
-
-        def row_ok(meta: dict[str, Any]) -> bool:
-            doc_id = str(meta.get("doc_id", "")).strip()
-            if doc_id not in evidence_docs:
-                return False
-            if restrict_docs is not None and doc_id not in restrict_docs:
-                return False
-            return True
+        ext_where: dict[str, Any] = {"course": KB_COURSE_EXTERNAL_KNOWLEDGE}
+        if restrict_doc_ids is not None:
+            doc_clause = {"doc_id": {"$in": sorted(restrict_doc_ids)}}
+            ext_where = {"$and": [ext_where, doc_clause]}
 
         strategy = self.settings.text_retrieval_strategy
         fused_scores: dict[str, float] = {}
@@ -1194,10 +1180,12 @@ class CourseRetriever:
             for rank, chunk_id in enumerate(dense_ids, start=1):
                 fused_scores[chunk_id] = 1.0 / float(rank)
         elif strategy == TextRetrievalStrategy.BM25_ONLY:
-            bm25_ids = self._bm25_search_with_predicate(
+            bm25_ids = self._bm25_search(
                 query=query,
+                course_filter=KB_COURSE_EXTERNAL_KNOWLEDGE,
+                week_filter="",
                 n_results=max(top_k, self.settings.bm25_k),
-                row_predicate=row_ok,
+                restrict_doc_ids=restrict_doc_ids,
             )
             _trace_log(
                 "retrieval.external bm25_only count=%d bm25_head=%s",
@@ -1210,10 +1198,12 @@ class CourseRetriever:
             dense_ids = self._dense_search(
                 query, where=ext_where, n_results=max(top_k, self.settings.dense_k)
             )
-            bm25_ids = self._bm25_search_with_predicate(
+            bm25_ids = self._bm25_search(
                 query=query,
+                course_filter=KB_COURSE_EXTERNAL_KNOWLEDGE,
+                week_filter="",
                 n_results=max(top_k, self.settings.bm25_k),
-                row_predicate=row_ok,
+                restrict_doc_ids=restrict_doc_ids,
             )
             _trace_log(
                 "retrieval.external hybrid dense=%d bm25=%d dense_head=%s bm25_head=%s",
@@ -1234,12 +1224,11 @@ class CourseRetriever:
             if len(text_hits) >= max(1, top_k):
                 break
             hit = self._hydrate_hit(chunk_id, score=fused_scores.get(chunk_id, 0.0))
-            meta = hit.get("metadata", {}) or {}
-            doc_h = str(meta.get("doc_id", "")).strip()
-            if doc_h not in evidence_docs:
-                continue
-            if restrict_docs is not None and doc_h not in restrict_docs:
-                continue
+            if restrict_doc_ids is not None:
+                meta = hit.get("metadata", {}) or {}
+                doc_h = str(meta.get("doc_id", "")).strip()
+                if doc_h not in restrict_doc_ids:
+                    continue
             text_hits.append(hit)
         _trace_log(
             "retrieval.external ranked count=%d kept=%s head_hit_ids=%s",
@@ -1283,6 +1272,8 @@ def kb_course_retrieval(
 ) -> str:
     """
     C1 CourseQA retrieval (internal): grounded snippets limited to KB documents tagged ``course-content``.
+    When the assistant cites materials with ``[filename.ext]`` brackets, each tag must exactly copy a
+    ``source_file=`` basename from these results (same spelling and punctuation).
 
     Args:
         query: User query/topic to retrieve evidence for.
@@ -1291,12 +1282,13 @@ def kb_course_retrieval(
         week_filter: Optional explicit week filter (for example, week-03).
     """
     settings = get_settings()
+    meta_on = settings.retrieval_metadata_filter_enabled
     resolved_course = _resolve_course_filter(
         course_filter,
         query,
-        filter_enabled=settings.course_filter_enabled,
+        filter_enabled=meta_on,
     )
-    resolved_week = _resolve_week_filter(week_filter, query=query)
+    resolved_week = _resolve_week_filter(week_filter, query=query, infer_from_query=meta_on)
 
     normalized_query = query.strip()
     if not normalized_query:
@@ -1304,17 +1296,17 @@ def kb_course_retrieval(
     restrict_course_docs = get_doc_ids_with_tag(KB_TAG_COURSE_CONTENT)
     _trace_log(
         "c1.kb_course_retrieval query=%r tool_course=%r tool_week=%r resolved_course=%r resolved_week=%r "
-        "course_content_doc_scope=%s",
+        "metadata_filter=%s course_content_doc_scope=%s",
         normalized_query,
         course_filter,
         week_filter,
         resolved_course,
         resolved_week,
+        meta_on,
         len(restrict_course_docs),
     )
 
-    # resolved_* are always computed for the tool transcript; only applied inside
-    # CourseRetriever.search when settings.retrieval_metadata_filter_enabled is True.
+    # resolved_* feed retrieval only when metadata filtering is enabled (CourseRetriever.search).
     hits = get_retriever().search(
         query=normalized_query,
         top_k=max(1, int(top_k)),
@@ -1328,15 +1320,21 @@ def kb_course_retrieval(
         return "COURSE_RETRIEVAL_RESULTS:\nNo grounded snippets found for the current filters."
 
     lines: list[str] = ["C1A_RETRIEVAL_RESULTS:"]
-    meta_on = settings.retrieval_metadata_filter_enabled
-    lines.append(
-        f"Applied filters -> metadata_filter={'on' if meta_on else 'off'}"
-        f" | course={resolved_course or 'none'} | week={resolved_week or 'none'}"
-        f" | corpus_tags={KB_TAG_COURSE_CONTENT}"
-        f" | top_k={max(1, int(top_k))}"
-        f" | rag_mode={settings.rag_mode.value}"
-        f" | retrieval_strategy={settings.text_retrieval_strategy.value}"
+    applied_parts = [
+        f"metadata_filter={'on' if meta_on else 'off'}",
+    ]
+    if meta_on:
+        applied_parts.append(f"course={resolved_course or 'none'}")
+        applied_parts.append(f"week={resolved_week or 'none'}")
+    applied_parts.extend(
+        [
+            f"corpus_tags={KB_TAG_COURSE_CONTENT}",
+            f"top_k={max(1, int(top_k))}",
+            f"rag_mode={settings.rag_mode.value}",
+            f"retrieval_strategy={settings.text_retrieval_strategy.value}",
+        ]
     )
+    lines.append("Applied filters -> " + " | ".join(applied_parts))
     image_paths: list[str] = []
     for rank, hit in enumerate(hits, start=1):
         metadata = hit.get("metadata", {}) or {}
@@ -1383,7 +1381,7 @@ def kb_external_research_retrieval(
     theme_hint: str = "",
 ) -> str:
     """
-    C6 Research QA (internal): grounded snippets from ``documents.csv`` rows tagged ``evidence`` only.
+    C6 Research QA (internal): grounded snippets from KB chunks with ``course=external-knowledge``.
 
     Use for evidence on task prioritization, study techniques and learning science,
     cognitive load / energy scheduling, breaks and recovery, habit formation, etc.
@@ -1428,7 +1426,8 @@ def kb_external_research_retrieval(
                 allow = theme_docs
         else:
             catalog_note = (
-                "Catalog note: theme_hint matched no rows in external_papers.csv; searched all evidence-tagged documents."
+                "Catalog note: theme_hint matched no rows in external_papers.csv; "
+                f"searched full {KB_COURSE_EXTERNAL_KNOWLEDGE} corpus."
             )
 
     _trace_log(
@@ -1447,13 +1446,16 @@ def kb_external_research_retrieval(
     _trace_log("c6.retrieval hits=%d", len(hits))
 
     if not hits:
-        return "C6_RESEARCH_QA_RETRIEVAL_RESULTS:\nNo grounded snippets found for evidence-tagged documents with current filters."
+        return (
+            "C6_RESEARCH_QA_RETRIEVAL_RESULTS:\nNo grounded snippets found for "
+            f"course={KB_COURSE_EXTERNAL_KNOWLEDGE} with current filters."
+        )
 
     lines: list[str] = ["C6_RESEARCH_QA_RETRIEVAL_RESULTS:"]
     if catalog_note:
         lines.append(catalog_note)
     lines.append(
-        f"Applied scope -> corpus_tags={KB_TAG_EVIDENCE}"
+        f"Applied scope -> course={KB_COURSE_EXTERNAL_KNOWLEDGE}"
         f" | paper_id_filter={pid or 'none'} | theme_hint={th or 'none'}"
         f" | top_k={max(1, int(top_k))}"
         f" | rag_mode={settings.rag_mode.value}"
@@ -1560,12 +1562,15 @@ def _estimate_study_duration_mode(
         return "C2_DURATION_ESTIMATE:\nquery field was missing."
 
     settings = get_settings()
+    meta_on = settings.retrieval_metadata_filter_enabled
     resolved_course = _resolve_course_filter(
         course_filter,
         normalized_task_query,
-        filter_enabled=settings.course_filter_enabled,
+        filter_enabled=meta_on,
     )
-    resolved_week = _resolve_week_filter(week_filter, query=normalized_task_query)
+    resolved_week = _resolve_week_filter(
+        week_filter, query=normalized_task_query, infer_from_query=meta_on
+    )
     resolved_day = _normalize_day_filter(day_filter) or _detect_day_filter(normalized_task_query)
     outcome = target_outcome.strip().lower() or "unspecified"
     logger.info(
@@ -1643,7 +1648,7 @@ def _estimate_study_duration_mode(
     logger.info(
         "c2_debug course_material_images count=%d multimodal_mode=%s",
         len(image_paths),
-        settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM,
+        _ablation_uses_multimodal_retrieval(settings.rag_mode),
     )
 
     prompt_text = _build_duration_prompt_payload(
@@ -1671,7 +1676,8 @@ def _estimate_study_duration_mode(
         "Do not call any tools."
     )
 
-    if settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM and image_paths:
+    mllm_understanding_on = _ablation_uses_multimodal_understanding(settings.rag_mode)
+    if mllm_understanding_on and image_paths:
         multimodal_payload: list[dict[str, Any]] = [{"type": "text", "text": prompt_text}]
         for image_path in list(dict.fromkeys(image_paths))[: max(1, settings.mllm_max_images)]:
             data_url = _image_path_to_data_url(image_path, settings.mllm_max_image_edge)
@@ -1690,7 +1696,7 @@ def _estimate_study_duration_mode(
     logger.info(
         "c2_debug estimator_llm_invoke mode=%s multimodal_payload=%s images_attached=%d prompt_chars=%d",
         mode_name,
-        settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM and bool(image_paths),
+        mllm_understanding_on and bool(image_paths),
         len(list(dict.fromkeys(image_paths))) if image_paths else 0,
         len(prompt_text),
     )
@@ -1731,15 +1737,26 @@ def _estimate_study_duration_mode(
     }
     lines = [
         "C2_DURATION_ESTIMATE:",
-        (
-            f"Applied filters -> mode={mode_name} | retrieval_strategy={settings.text_retrieval_strategy.value} | "
-            f"course={resolved_course or 'none'} | week={resolved_week or 'none'} | day={resolved_day or 'none'} | outcome={outcome}"
-        ),
-        f"REQUIRED_MINUTES={estimated_minutes}",
-        f"RESOLVED_WEEK_FILTER={resolved_week or ''}",
-        f"RESOLVED_DAY_FILTER={resolved_day or ''}",
-        f"ESTIMATE_JSON={json.dumps(result_payload, ensure_ascii=True)}",
     ]
+    applied_parts = [
+        f"metadata_filter={'on' if meta_on else 'off'}",
+        f"mode={mode_name}",
+        f"retrieval_strategy={settings.text_retrieval_strategy.value}",
+    ]
+    if meta_on:
+        applied_parts.append(f"course={resolved_course or 'none'}")
+        applied_parts.append(f"week={resolved_week or 'none'}")
+    applied_parts.append(f"day={resolved_day or 'none'}")
+    applied_parts.append(f"outcome={outcome}")
+    lines.append("Applied filters -> " + " | ".join(applied_parts))
+    lines.extend(
+        [
+            f"REQUIRED_MINUTES={estimated_minutes}",
+            f"RESOLVED_WEEK_FILTER={resolved_week or ''}",
+            f"RESOLVED_DAY_FILTER={resolved_day or ''}",
+            f"ESTIMATE_JSON={json.dumps(result_payload, ensure_ascii=True)}",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -1760,18 +1777,20 @@ def _extract_events_from_planner_screenshots(
     day_filter: str,
     top_k: int,
     include_images: bool,
+    enable_multimodal_retrieval: bool,
 ) -> list[dict[str, Any]]:
     """Extract planner events from indexed planner screenshot OCR snippets."""
     logger = logging.getLogger(__name__)
     settings = get_settings()
     normalized_week = week_filter.strip().lower()
     logger.info(
-        "c2_debug screenshot_extract start query=%r week_filter=%r day_filter=%r top_k=%d include_images=%s",
+        "c2_debug screenshot_extract start query=%r week_filter=%r day_filter=%r top_k=%d include_images=%s multimodal_retrieval=%s",
         _truncate_for_log(query, 180),
         normalized_week,
         day_filter,
         max(6, int(top_k)),
         include_images,
+        enable_multimodal_retrieval,
     )
     snippet_lines: list[str] = []
     image_paths: list[str] = []
@@ -1780,7 +1799,7 @@ def _extract_events_from_planner_screenshots(
         top_k=max(6, int(top_k)),
         course_filter="personal-planner",
         week_filter=normalized_week,
-        enable_multimodal_fusion=False,
+        enable_multimodal_fusion=enable_multimodal_retrieval,
     )
     logger.info("c2_debug screenshot_extract retrieval_hits count=%d", len(hits))
     for hit in hits:
@@ -1797,7 +1816,7 @@ def _extract_events_from_planner_screenshots(
         source_abs = str((_BASE_DIR / source_path).resolve()) if source_path else ""
         if source_abs and Path(source_abs).exists():
             image_paths.append(source_abs)
-    if include_images:
+    if enable_multimodal_retrieval:
         image_paths.extend(
             get_retriever().search_planner_images(
                 query=query,
@@ -2061,11 +2080,11 @@ def _find_free_slots_from_mode(
     mode_name: str,
 ) -> str:
     """Shared C3 implementation using evidence-only planner screenshot retrieval."""
-    c3_mode_name = (
-        RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM.value
-        if get_settings().rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM
-        else RAGPipelineMode.TEXT_ONLY.value
-    )
+    settings = get_settings()
+    rag_mode = settings.rag_mode
+    c3_mode_name = rag_mode.value
+    multimodal_retrieval_on = _ablation_uses_multimodal_retrieval(rag_mode)
+    mllm_understanding_on = _ablation_uses_multimodal_understanding(rag_mode)
     resolved_week = _resolve_week_filter(week_filter)
     if not resolved_week:
         return "C3_FREE_SLOTS:\nweek_filter field was missing."
@@ -2082,8 +2101,9 @@ def _find_free_slots_from_mode(
         query=_build_c3_planner_query(resolved_week, resolved_day),
         week_filter=resolved_week,
         day_filter=resolved_day,
-        top_k=max(12, int(get_settings().hybrid_k) * 3),
-        include_images=c3_mode_name == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM.value,
+        top_k=max(12, int(settings.hybrid_k) * 3),
+        include_images=mllm_understanding_on,
+        enable_multimodal_retrieval=multimodal_retrieval_on,
     )
     if c3_mode_name == RAGPipelineMode.TEXT_ONLY.value and not resolved_day:
         date_anchored = sum(
@@ -2180,12 +2200,12 @@ def _query_study_environment_text_scores(
 
 
 def _query_study_environment_image_scores(query: str, top_k: int) -> dict[str, float]:
-    """Query indexed study-location photos in planner_images and return source_path scores."""
+    """Query indexed study location photos in planner_images and return source_path scores."""
     retriever = get_retriever()
     if retriever.image_collection.count() <= 0:
         return {}
     query_embedding = retriever.backbone.encode_text([query])[0]
-    where = {"$and": [{"course": "study-environment"}, {"raw_folder": "study-location-photos"}]}
+    where = {"course": "study-environment"}
     try:
         results = retriever.image_collection.query(
             query_embeddings=[query_embedding],
@@ -2262,11 +2282,8 @@ def _run_study_environment_tool(
         normalized_query,
         top_k=max(8, int(top_k) * 3),
     )
-    multimodal_retrieval_on = settings.rag_mode == RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM
-    mllm_understanding_on = settings.rag_mode in {
-        RAGPipelineMode.TEXT_RETRIEVAL_MLLM,
-        RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM,
-    }
+    multimodal_retrieval_on = _ablation_uses_multimodal_retrieval(settings.rag_mode)
+    mllm_understanding_on = _ablation_uses_multimodal_understanding(settings.rag_mode)
     image_scores = (
         _query_study_environment_image_scores(normalized_query, top_k=max(6, int(top_k) * 2))
         if multimodal_retrieval_on
@@ -2516,11 +2533,13 @@ SYSTEM_PROMPT = SystemMessage(
     content=(
         "You are a study planner assistant with six capability labels C1–C5 and C6.\n"
         "C1 CourseQA / TopicSummary: summarize course/week material using kb_course_retrieval "
-        "(only docs tagged ``course-content`` in ``documents.csv``—never syllabus-unrelated KB).\n"
+        "(only docs tagged ``course-content`` in ``documents.csv``—never syllabus-unrelated KB). "
+        "If you use ``[filename.ext]`` evidence brackets, copy basenames only from retrieval ``source_file=`` lines.\n"
         "C6 ResearchQA: answer from indexed research using kb_external_research_retrieval "
-        "(only docs tagged ``evidence``: task prioritization, study techniques, cognitive load "
+        "(``course=external-knowledge`` papers: task prioritization, study techniques, cognitive load "
         "and scheduling energy, breaks and recovery, habit formation, behavior change). Optionally set "
-        "theme_hint from the user wording and paper_id if they name an extp_* catalog id.\n"
+        "theme_hint from the user wording and paper_id if they name an extp_* catalog id. "
+        "If you use ``[filename.ext]`` evidence brackets, copy basenames only from retrieval ``source_file=`` lines.\n"
         "C2 DurationEstimator: estimate task minutes with estimate_study_duration.\n"
         "C3 FreeSlotFinder: find open schedule slots with find_free_slots.\n"
         "C4 StudyEnvironmentRecommender: use recommend_study_environment to choose where to work.\n"
@@ -2535,6 +2554,9 @@ SYSTEM_PROMPT = SystemMessage(
         "- If user asks where to do a task or asks for best study place/environment, call recommend_study_environment first (C4).\n"
         "- If user asks 'Is it a good idea to do this task in [environment]?', call assess_study_environment_fit first (C5) "
         "and preserve the environment mention in environment_hint.\n"
+        "- If the user needs several planner capabilities in one message, you may emit multiple tool_calls in one "
+        "assistant turn; they run **in order**, one tool per graph step, so each later call can rely on earlier "
+        "tool outputs already present in the transcript.\n"
         "Always include required tool arguments."
     )
 )
@@ -2542,13 +2564,11 @@ SYSTEM_PROMPT = SystemMessage(
 
 def _build_llm(settings: Settings):
     """Create Gemini backend and bind available tools."""
-    if settings.llm_backend != LLMBackend.GEMINI:
-        raise ValueError("This agent is configured for Gemini-only runtime.")
     from langchain_google_genai import ChatGoogleGenerativeAI
 
     if not settings.gemini_api_key:
         raise ValueError(
-            "Gemini selected but API key is missing. Set GOOGLE_API_KEY or GEMINI_API_KEY."
+            "Gemini API key is missing. Set GOOGLE_API_KEY."
         )
     return ChatGoogleGenerativeAI(
         model=settings.gemini_model,
@@ -2560,13 +2580,11 @@ def _build_llm(settings: Settings):
 
 def _build_reasoning_llm(settings: Settings):
     """Create a plain Gemini client without bound tools."""
-    if settings.llm_backend != LLMBackend.GEMINI:
-        raise ValueError("This agent is configured for Gemini-only runtime.")
     from langchain_google_genai import ChatGoogleGenerativeAI
 
     if not settings.gemini_api_key:
         raise ValueError(
-            "Gemini selected but API key is missing. Set GOOGLE_API_KEY or GEMINI_API_KEY."
+            "Gemini API key is missing. Set GOOGLE_API_KEY."
         )
     return ChatGoogleGenerativeAI(
         model=settings.gemini_model,
@@ -2727,12 +2745,16 @@ def _parse_applied_filters_from_blob(text: str) -> dict[str, str]:
     }
 
 
-def _tool_call_args_for_executed_tool(messages: list[BaseMessage], tool_name: str) -> dict[str, Any]:
-    """Args from the AIMessage tool call that produced the last ToolMessage."""
-    if len(messages) < 2 or getattr(messages[-1], "type", None) != "tool":
+def _tool_call_args_for_tool_message(messages: list[BaseMessage], tool_msg: BaseMessage) -> dict[str, Any]:
+    """Args from the AIMessage tool call that produced this ToolMessage (matches tool_call_id when present)."""
+    if getattr(tool_msg, "type", None) != "tool":
         return {}
-    want_id = str(getattr(messages[-1], "tool_call_id", "") or "")
-    for i in range(len(messages) - 2, -1, -1):
+    want_id = str(getattr(tool_msg, "tool_call_id", "") or "")
+    tool_name = str(getattr(tool_msg, "name", "") or "").strip()
+    idx = next((i for i, m in enumerate(messages) if m is tool_msg), -1)
+    if idx < 0:
+        return {}
+    for i in range(idx - 1, -1, -1):
         m = messages[i]
         calls = getattr(m, "tool_calls", None) or []
         if not calls:
@@ -2843,6 +2865,101 @@ def _c2_query_is_underspecified(user_query: str) -> bool:
     return not has_week_scope and not has_specific_material
 
 
+def _json_assigned_on_line(text: str, key: str) -> Any | None:
+    """
+    Parse JSON from the first stripped line starting with ``key=<json>``.
+
+    Tool transcripts use ``ESTIMATE_JSON=``, ``SLOTS_JSON=``, ``RECOMMENDATION_JSON=``
+    (single-line ``json.dumps(..., ensure_ascii=True)`` payloads).
+    """
+    prefix = f"{key}="
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s.startswith(prefix):
+            continue
+        tail = s[len(prefix) :].strip()
+        if not tail:
+            return None
+        try:
+            return json.loads(tail)
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _estimate_json_blob_invalid(text: str) -> str:
+    """Return a reason code if ``ESTIMATE_JSON`` is missing/unparseable/invalid; else ``''``."""
+    parsed = _json_assigned_on_line(text, "ESTIMATE_JSON")
+    if parsed is None:
+        return "invalid_estimate_json_parse"
+    if not isinstance(parsed, dict):
+        return "invalid_estimate_json_shape"
+    minutes = _safe_int(parsed.get("estimated_minutes"), 0)
+    if minutes <= 0:
+        return "invalid_estimate_minutes_json"
+    req = re.search(r"REQUIRED_MINUTES=(\d+)", text)
+    if req and int(req.group(1)) != minutes:
+        return "estimate_required_minutes_json_mismatch"
+    conf = str(parsed.get("confidence", "")).strip().lower()
+    if conf and conf not in {"low", "medium", "high"}:
+        return "invalid_estimate_confidence_json"
+    return ""
+
+
+def _slots_json_blob_invalid(text: str) -> str:
+    """Return a reason code if ``SLOTS_JSON`` is invalid for a successful C3 blob; else ``''``."""
+    parsed = _json_assigned_on_line(text, "SLOTS_JSON")
+    if parsed is None:
+        return "invalid_slots_json_parse"
+    if not isinstance(parsed, list) or len(parsed) == 0:
+        return "invalid_slots_json_shape"
+    for item in parsed:
+        if not isinstance(item, dict):
+            return "invalid_slots_json_item"
+        for field in ("date", "day", "start", "end", "duration"):
+            if field not in item:
+                return "invalid_slots_json_fields"
+        try:
+            start_m = int(item["start"])
+            end_m = int(item["end"])
+            duration = int(item["duration"])
+        except (TypeError, ValueError):
+            return "invalid_slots_json_types"
+        if end_m <= start_m or duration <= 0:
+            return "invalid_slots_json_bounds"
+        if duration != end_m - start_m:
+            return "invalid_slots_json_duration_mismatch"
+    return ""
+
+
+def _recommendation_json_blob_invalid(text: str) -> str:
+    """Return a reason code if ``RECOMMENDATION_JSON`` is invalid; else ``''``."""
+    parsed = _json_assigned_on_line(text, "RECOMMENDATION_JSON")
+    if parsed is None:
+        return "invalid_recommendation_json_parse"
+    if not isinstance(parsed, dict):
+        return "invalid_recommendation_json_shape"
+    env_id = str(parsed.get("environment_id", "")).strip()
+    if not env_id:
+        return "missing_environment_id_json"
+    verdict = str(parsed.get("verdict", "")).strip().lower()
+    if verdict not in {"yes", "maybe", "no"}:
+        return "invalid_verdict_json"
+    mode = str(parsed.get("assessment_mode", "")).strip().lower()
+    if mode not in {"targeted", "recommendation"}:
+        return "invalid_assessment_mode_json"
+    fr = parsed.get("factor_rationale", [])
+    if not isinstance(fr, list):
+        return "invalid_factor_rationale_json"
+    oie = parsed.get("observable_image_evidence", [])
+    if not isinstance(oie, list):
+        return "invalid_observable_image_evidence_json"
+    conf = str(parsed.get("confidence", "")).strip().lower()
+    if conf and conf not in {"high", "medium", "low"}:
+        return "invalid_recommendation_confidence_json"
+    return ""
+
+
 def _tool_output_is_weak(
     tool_name: str,
     tool_result: str,
@@ -2905,8 +3022,19 @@ def _tool_output_is_weak(
         match = re.search(r"REQUIRED_MINUTES=(\d+)", text)
         if not match or int(match.group(1)) <= 0:
             return True, "non_positive_minutes"
-        week_match = re.search(r"Applied filters ->[^\n]*week=([^\s|]+)", text)
+        week_match = re.search(r"Applied filters ->[^\n]*\bweek=([^\s|]+)", text)
         resolved_week = week_match.group(1).strip().lower() if week_match else ""
+        if resolved_week in {"", "none", "unknown", "?"}:
+            rw_line = re.search(r"(?m)^RESOLVED_WEEK_FILTER=(.*)$", text)
+            if rw_line:
+                resolved_week = rw_line.group(1).strip().lower()
+        if resolved_week in {"", "none", "unknown", "?"}:
+            wf_raw = str((tool_call_args or {}).get("week_filter", "")).strip()
+            resolved_week = (
+                _canonicalize_week_filter(wf_raw, allow_bare_number=True).strip().lower()
+                if wf_raw
+                else ""
+            )
         outcome_match = re.search(r"Applied filters ->[^\n]*outcome=([^\s|]+)", text)
         resolved_outcome = outcome_match.group(1).strip().lower() if outcome_match else ""
         if (
@@ -2915,6 +3043,9 @@ def _tool_output_is_weak(
             and _c2_query_is_underspecified(user_query)
         ):
             return True, "underspecified_duration_request"
+        bad_json = _estimate_json_blob_invalid(text)
+        if bad_json:
+            return True, bad_json
         return False, ""
 
     if tool_name == "find_free_slots":
@@ -2922,16 +3053,25 @@ def _tool_output_is_weak(
             return True, "missing_slots_json"
         if not _c3_has_time_anchor(user_query, tool_call_args or {}, text):
             return True, "no_user_time_scope"
+        bad_json = _slots_json_blob_invalid(text)
+        if bad_json:
+            return True, bad_json
         return False, ""
 
     if tool_name == "recommend_study_environment":
         if "C4_STUDY_ENVIRONMENT:" not in text or "RECOMMENDATION_JSON=" not in text:
             return True, "missing_environment_json"
+        bad_json = _recommendation_json_blob_invalid(text)
+        if bad_json:
+            return True, bad_json
         return False, ""
 
     if tool_name == "assess_study_environment_fit":
         if "C5_STUDY_ENVIRONMENT:" not in text or "RECOMMENDATION_JSON=" not in text:
             return True, "missing_environment_json"
+        bad_json = _recommendation_json_blob_invalid(text)
+        if bad_json:
+            return True, bad_json
         return False, ""
 
     return False, ""
@@ -2956,7 +3096,7 @@ def _clarifying_question_for_tool(tool_name: str, reason: str = "") -> str:
                 "Please repeat the question; the agent should scope to that paper only."
             )
         return (
-            "I could not find strong snippets among evidence-tagged documents. "
+            "I could not find strong snippets in the external-knowledge research corpus. "
             "Could you rephrase with more specific keywords (topic or paper_id extp_* if relevant)?"
         )
     if tool_name == "estimate_study_duration":
@@ -2971,15 +3111,76 @@ def _clarifying_question_for_tool(tool_name: str, reason: str = "") -> str:
         )
     if tool_name == "recommend_study_environment":
         return (
-            "I need a bit more detail to recommend a study environment (C4). "
+            "I need a bit more detail to recommend a study environment. "
             "Could you include the task type and any priority constraints (quiet, internet, duration)?"
         )
     if tool_name == "assess_study_environment_fit":
         return (
-            "I need a bit more detail to assess environment fit (C5). "
+            "I need a bit more detail to assess environment fit. "
             "Could you include the task type, which environment you mean, and any priority constraints?"
         )
     return "I need a bit more detail to give a reliable grounded answer. Could you clarify?"
+
+
+def _kb_tool_result_after_retry(
+    tool_name: str,
+    tool_result: str,
+    user_query: str,
+    settings: Settings,
+) -> str:
+    """Re-run KB tools with the latest user text when the model omitted query or got empty snippets."""
+    lower_tool_result = tool_result.lower()
+    missing_kb_query = (
+        tool_name in {"kb_course_retrieval", "kb_external_research_retrieval"}
+        and (
+            "query field was missing" in lower_tool_result
+            or ("field required" in lower_tool_result and "query" in lower_tool_result)
+        )
+    )
+    kb_no_snippets = tool_name in {
+        "kb_course_retrieval",
+        "kb_external_research_retrieval",
+    } and ("no grounded snippets found" in lower_tool_result)
+    if not ((missing_kb_query or kb_no_snippets) and user_query.strip()):
+        return tool_result
+    logging.getLogger(__name__).warning(
+        "tool_retry %s -> retrying with latest user query only "
+        "(missing_query=%s empty_snippets=%s)",
+        tool_name,
+        bool(missing_kb_query),
+        bool(kb_no_snippets),
+    )
+    try:
+        _trace_log("agent_node retry %s with query=%r", tool_name, user_query.strip())
+        if tool_name == "kb_course_retrieval":
+            return str(
+                kb_course_retrieval.invoke(
+                    {
+                        "query": user_query.strip(),
+                        "top_k": max(1, settings.hybrid_k),
+                    }
+                )
+            )
+        payload: dict[str, Any] = {
+            "query": user_query.strip(),
+            "top_k": max(1, settings.hybrid_k),
+        }
+        fpid = _c6_paper_id_to_force(user_query)
+        if fpid:
+            payload["paper_id"] = fpid
+        return str(kb_external_research_retrieval.invoke(payload))
+    except Exception as exc:
+        logging.getLogger(__name__).warning("tool_retry failed: %s", exc)
+        return tool_result
+
+
+def _tool_calls_dict_list(raw: Any) -> list[dict[str, Any]]:
+    """Deep-copy tool call dicts from an AIMessage for safe queueing."""
+    out: list[dict[str, Any]] = []
+    for c in (raw or []):
+        if isinstance(c, dict):
+            out.append(copy.deepcopy(c))
+    return out
 
 
 def agent_node(state: AgentState):
@@ -2990,53 +3191,16 @@ def agent_node(state: AgentState):
 
     if messages and getattr(messages[-1], "type", None) == "tool":
         settings = get_settings()
-        tool_name = str(getattr(messages[-1], "name", "")).strip()
-        tool_result = str(messages[-1].content)
-        _trace_log("agent_node tool_result name=%s preview=%r", tool_name, _truncate_for_log(tool_result, 180))
-        lower_tool_result = tool_result.lower()
-        missing_kb_query = (
-            tool_name in {"kb_course_retrieval", "kb_external_research_retrieval"}
-            and (
-                "query field was missing" in lower_tool_result
-                or ("field required" in lower_tool_result and "query" in lower_tool_result)
-            )
-        )
-        kb_no_snippets = tool_name in {
-            "kb_course_retrieval",
-            "kb_external_research_retrieval",
-        } and ("no grounded snippets found" in lower_tool_result)
-        if (missing_kb_query or kb_no_snippets) and user_query.strip():
-            logging.getLogger(__name__).warning(
-                "tool_retry %s -> retrying with latest user query only "
-                "(missing_query=%s empty_snippets=%s)",
-                tool_name,
-                bool(missing_kb_query),
-                bool(kb_no_snippets),
-            )
-            try:
-                _trace_log("agent_node retry %s with query=%r", tool_name, user_query.strip())
-                if tool_name == "kb_course_retrieval":
-                    tool_result = str(
-                        kb_course_retrieval.invoke(
-                            {
-                                "query": user_query.strip(),
-                                "top_k": max(1, settings.hybrid_k),
-                            }
-                        )
-                    )
-                else:
-                    payload: dict[str, Any] = {
-                        "query": user_query.strip(),
-                        "top_k": max(1, settings.hybrid_k),
-                    }
-                    fpid = _c6_paper_id_to_force(user_query)
-                    if fpid:
-                        payload["paper_id"] = fpid
-                    tool_result = str(kb_external_research_retrieval.invoke(payload))
-            except Exception as exc:
-                logging.getLogger(__name__).warning("tool_retry failed: %s", exc)
-
         non_tool_messages = [m for m in messages if getattr(m, "type", None) != "tool"]
+        tm = messages[-1]
+        tool_name = str(getattr(tm, "name", "")).strip()
+        tool_result = str(tm.content)
+        tool_result = _kb_tool_result_after_retry(tool_name, tool_result, user_query, settings)
+        _trace_log(
+            "agent_node tool_result name=%s preview=%r",
+            tool_name,
+            _truncate_for_log(tool_result, 180),
+        )
 
         if tool_name == "estimate_study_duration":
             c2_payload = (
@@ -3051,7 +3215,6 @@ def agent_node(state: AgentState):
                         "Output format:\n"
                         "- Estimated effort: minutes and suggested blocking\n"
                         "- Confidence and rationale grounded in provided evidence\n"
-                        "- Optional next step: suggest calling C3 with required_minutes"
                     )
                 ),
                 HumanMessage(content=c2_payload),
@@ -3081,10 +3244,7 @@ def agent_node(state: AgentState):
                 f"{tool_result}"
             )
             image_paths = _extract_image_paths(tool_result)
-            include_images = settings.rag_mode in {
-                RAGPipelineMode.TEXT_RETRIEVAL_MLLM,
-                RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM,
-            }
+            include_images = _ablation_uses_multimodal_understanding(settings.rag_mode)
             c4_user_payload: str | list[dict[str, Any]]
             if include_images and image_paths:
                 multimodal_content: list[dict[str, Any]] = [{"type": "text", "text": c4_payload_text}]
@@ -3144,10 +3304,7 @@ def agent_node(state: AgentState):
             ]
         else:
             image_paths = _extract_image_paths(tool_result)
-            include_images = settings.rag_mode in {
-                RAGPipelineMode.TEXT_RETRIEVAL_MLLM,
-                RAGPipelineMode.MULTIMODAL_RETRIEVAL_MLLM,
-            }
+            include_images = _ablation_uses_multimodal_understanding(settings.rag_mode)
             user_payload: str | list[dict[str, Any]]
             if include_images and image_paths:
                 multimodal_content: list[dict[str, Any]] = [
@@ -3204,7 +3361,9 @@ def agent_node(state: AgentState):
                     "Do not mention unrelated details. If evidence is weak, say so.\n"
                     "Output format:\n"
                     "- 3-6 topic bullets\n"
-                    "- Optional short evidence note per topic using filename only in brackets, e.g. [lecture3.pdf]"
+                    "- When you add evidence brackets, use only tags that exactly copy a source_file= filename "
+                    "from the retrieved lines above (same spelling and punctuation). Do not bracket any other "
+                    "filename or invented short name; if none apply, omit bracket tags."
                 )
             prompt_messages = non_tool_messages + [
                 SystemMessage(content=retrieval_guide),
@@ -3229,26 +3388,66 @@ def agent_node(state: AgentState):
         )
     else:
         logging.getLogger(__name__).info("agent_loop_debug model_requested_tools count=0")
-        if (
-            messages
-            and getattr(messages[-1], "type", None) == "tool"
-            and str(getattr(messages[-1], "name", "")).strip() == "kb_external_research_retrieval"
-            and _c6_is_single_paper_user_query(user_query)
+        trailing = (
+            messages[-1]
+            if messages and getattr(messages[-1], "type", None) == "tool"
+            else None
+        )
+        if trailing is not None and str(getattr(trailing, "name", "")).strip() in (
+            "kb_course_retrieval",
+            "kb_external_research_retrieval",
         ):
             answer_text = _render_assistant_content(response.content)
-            if not _c6_final_citations_match_retrieval(answer_text, str(messages[-1].content)):
+            if not _bracket_file_citations_match_retrieval(answer_text, str(trailing.content)):
                 response = AIMessage(
                     content=(
-                        "I couldn't match every [.pdf] citation in my reply to this retrieval: each bracket tag "
-                        "must exactly copy a source_file= value from the evidence block, with no other filenames "
-                        "in brackets."
+                        "I couldn't match every file citation in my reply to this retrieval: each bracketed "
+                        "filename must exactly copy a source_file= value from the evidence block, with no other "
+                        "filenames in brackets."
                     )
                 )
     _trace_log("agent_node llm_response has_tool_calls=%s", bool(getattr(response, "tool_calls", None)))
     if getattr(response, "tool_calls", None):
         _trace_log("agent_node tool_calls=%s", getattr(response, "tool_calls", None))
     _log_missing_required_tool_args(getattr(response, "tool_calls", None))
-    return {"messages": messages + [response]}
+
+    out: dict[str, Any] = {"messages": messages + [response]}
+    tcalls = _tool_calls_dict_list(getattr(response, "tool_calls", None))
+    if len(tcalls) > 1:
+        first = tcalls[0]
+        response = response.model_copy(update={"tool_calls": [first]})
+        out["messages"] = messages + [response]
+        out["pending_tool_calls"] = tcalls[1:]
+        logging.getLogger(__name__).info(
+            "sequential_tools first_hop=%s queued=%d",
+            str(first.get("name", "")).strip(),
+            len(tcalls) - 1,
+        )
+    else:
+        out["pending_tool_calls"] = []
+    return out
+
+
+def deferred_tools_node(state: AgentState) -> dict[str, Any]:
+    """Pop the next queued tool call and append a synthetic AIMessage so ToolNode runs one tool per hop."""
+    pending = list(state.get("pending_tool_calls") or [])
+    if not pending:
+        return {}
+    rest = pending[1:]
+    head = copy.deepcopy(pending[0])
+    if not isinstance(head, dict) or not str(head.get("name", "")).strip():
+        logging.getLogger(__name__).warning("deferred_tools skipping invalid queue head")
+        return {"pending_tool_calls": rest}
+    synthetic = AIMessage(content="", tool_calls=[head])
+    logging.getLogger(__name__).info(
+        "sequential_tools deferred name=%s remaining_in_queue=%d",
+        str(head.get("name", "")).strip(),
+        len(rest),
+    )
+    return {
+        "messages": state["messages"] + [synthetic],
+        "pending_tool_calls": rest,
+    }
 
 
 def verifier_node(state: AgentState):
@@ -3264,11 +3463,33 @@ def verifier_node(state: AgentState):
 
     tool_name = str(getattr(messages[-1], "name", "")).strip()
     tool_result = str(messages[-1].content)
-    call_args = _tool_call_args_for_executed_tool(messages, tool_name)
+    user_query = _latest_user_text(messages)
+    # Run KB auto-retry here (before weak checks) so recovery is not skipped when
+    # the transcript would otherwise fail weak_markers in _tool_output_is_weak.
+    retried = _kb_tool_result_after_retry(
+        tool_name, tool_result, user_query, get_settings()
+    )
+    if retried != tool_result:
+        prev = messages[-1]
+        messages = [
+            *messages[:-1],
+            ToolMessage(
+                content=retried,
+                tool_call_id=str(getattr(prev, "tool_call_id", "") or ""),
+                name=str(getattr(prev, "name", "") or tool_name),
+            ),
+        ]
+        tool_result = retried
+        logging.getLogger(__name__).info(
+            "verifier kb_retry applied tool=%s changed_chars=%d",
+            tool_name,
+            abs(len(retried) - len(str(prev.content))),
+        )
+
+    call_args = _tool_call_args_for_tool_message(messages, messages[-1])
     mem_patch = _build_planner_memory_patch(tool_name, tool_result, call_args)
     merged_memory = {**_get_planner_memory(state), **mem_patch}
 
-    user_query = _latest_user_text(messages)
     is_weak, reason = _tool_output_is_weak(
         tool_name,
         tool_result,
@@ -3285,7 +3506,11 @@ def verifier_node(state: AgentState):
         return {"messages": messages, "planner_memory": merged_memory}
 
     question = _clarifying_question_for_tool(tool_name, reason)
-    return {"messages": messages + [AIMessage(content=question)], "planner_memory": merged_memory}
+    return {
+        "messages": messages + [AIMessage(content=question)],
+        "planner_memory": merged_memory,
+        "pending_tool_calls": [],
+    }
 
 
 def route_after_agent(state: AgentState):
@@ -3308,11 +3533,18 @@ def route_after_agent(state: AgentState):
 
 
 def route_after_verifier(state: AgentState):
-    """If verifier added a clarifying AI message, end; otherwise continue."""
+    """If verifier added a clarifying AI message, end; else run more queued tools or return to the agent."""
     last = state["messages"][-1]
     if getattr(last, "type", None) == "ai":
         logging.getLogger(__name__).info("agent_loop_debug verifier_route=end")
         return END
+    pending = list(state.get("pending_tool_calls") or [])
+    if pending:
+        logging.getLogger(__name__).info(
+            "agent_loop_debug verifier_route=deferred_tools remaining=%d",
+            len(pending),
+        )
+        return "deferred_tools"
     logging.getLogger(__name__).info("agent_loop_debug verifier_route=agent")
     return "agent"
 
@@ -3323,10 +3555,16 @@ graph = StateGraph(AgentState)
 graph.add_node("agent", agent_node)
 graph.add_node("tools", tool_node)
 graph.add_node("verifier", verifier_node)
+graph.add_node("deferred_tools", deferred_tools_node)
 graph.set_entry_point("agent")
 graph.add_conditional_edges("agent", route_after_agent, {"tools": "tools", END: END})
-graph.add_conditional_edges("verifier", route_after_verifier, {"agent": "agent", END: END})
+graph.add_conditional_edges(
+    "verifier",
+    route_after_verifier,
+    {"agent": "agent", "deferred_tools": "deferred_tools", END: END},
+)
 graph.add_edge("tools", "verifier")
+graph.add_edge("deferred_tools", "tools")
 app = graph.compile()
 
 
@@ -3368,6 +3606,7 @@ if __name__ == "__main__":
                     HumanMessage(content=user_text),
                 ],
                 "planner_memory": dict(session_memory),
+                "pending_tool_calls": [],
             }
         )
         merged = result.get("planner_memory")

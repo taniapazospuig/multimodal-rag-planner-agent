@@ -1,24 +1,10 @@
-"""Simple, readable runtime settings for the planner agent."""
+"""Central runtime settings for the planner agent."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 from enum import Enum
-
-
-# Defaults if environment variables missing:
-# - LLM: gemini-3.1-flash-lite
-# - Embeddings: OpenCLIP ViT-B-32 + laion2b_s34b_b79k
-DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
-DEFAULT_OPENCLIP_MODEL = "ViT-B-32"
-DEFAULT_OPENCLIP_PRETRAINED = "laion2b_s34b_b79k"
-
-
-class LLMBackend(str, Enum):
-    """Supported LLM backends."""
-    GEMINI = "gemini"
-    OLLAMA = "ollama"
 
 
 class RAGPipelineMode(str, Enum):
@@ -38,14 +24,8 @@ class TextRetrievalStrategy(str, Enum):
 @dataclass(frozen=True)
 class Settings:
     """Runtime settings for the planner agent."""
-    # LLM
-    llm_backend: LLMBackend
     gemini_model: str
     gemini_api_key: str | None
-
-    # Kept for compatibility with planner_agent's optional Ollama branch
-    ollama_base_url: str
-    ollama_model: str
 
     # Retrieval
     rag_mode: RAGPipelineMode
@@ -61,13 +41,40 @@ class Settings:
     rrf_k: int
     multimodal_fusion_alpha: float
     multimodal_fusion_k: int
-    course_filter_enabled: bool
-    # When False, dense/BM25/image Chroma queries run with no course/week where-clause
-    # (small corpora often rank better from query similarity alone). See CourseRetriever.search.
+    # When True: infer course/week from tool args + query (optional LLM course enum),
+    # apply them as Chroma ``where`` + BM25 post-filter, and echo resolved course/week in
+    # tool transcripts. When False: no query-side week/course inference; retrieval is not
+    # narrowed by course/week metadata. See CourseRetriever.search.
     retrieval_metadata_filter_enabled: bool
     debug_trace_enabled: bool
     mllm_max_images: int
     mllm_max_image_edge: int
+
+
+DEFAULTS = {
+    "GEMINI_MODEL": "gemini-3.1-flash-lite",
+    "PLANNER_RAG_MODE": RAGPipelineMode.TEXT_RETRIEVAL_MLLM.value,
+    "TEXT_RETRIEVAL_STRATEGY": TextRetrievalStrategy.HYBRID.value,
+    "OPEN_CLIP_MODEL": "ViT-B-32",
+    "OPEN_CLIP_PRETRAINED": "laion2b_s34b_b79k",
+    "TEXT_COLLECTION_NAME": "text_chunks",
+    "TEXT_BM25_PATH": "data/kb/02_index/bm25_corpus.jsonl",
+    "TEXT_CONTEXT_MODE": "metadata",
+    "TEXT_DENSE_K": 12,
+    "TEXT_BM25_K": 12,
+    "TEXT_HYBRID_K": 6,
+    "TEXT_RRF_K": 60,
+    "MULTIMODAL_FUSION_ALPHA": 0.7,
+    "MULTIMODAL_FUSION_K": 8,
+    "RETRIEVAL_METADATA_FILTER_ENABLED": True,
+    "DEBUG_TRACE_ENABLED": False,
+    "MLLM_MAX_IMAGES": 4,
+    "MLLM_MAX_IMAGE_EDGE": 1280,
+}
+
+
+def _str_env(name: str) -> str:
+    return (os.environ.get(name) or str(DEFAULTS[name])).strip()
 
 
 def _int_env(name: str, default: int) -> int:
@@ -93,6 +100,14 @@ def _float_env(name: str, default: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def _enum_env(name: str, enum_cls: type[Enum], default: str) -> Enum:
+    raw = (os.environ.get(name) or default).strip().lower()
+    valid = {item.value for item in enum_cls}  # type: ignore[attr-defined]
+    if raw in valid:
+        return enum_cls(raw)  # type: ignore[call-arg]
+    return enum_cls(default)  # type: ignore[call-arg]
+
+
 def load_settings() -> Settings:
     """Load settings from `.env` + environment with sane defaults."""
     try:
@@ -102,48 +117,55 @@ def load_settings() -> Settings:
     except ImportError:
         pass
 
-    mode_raw = (
-        os.environ.get("RAG_MODE")
-        or os.environ.get("PLANNER_RAG_MODE")
-        or RAGPipelineMode.TEXT_RETRIEVAL_MLLM.value
-    ).strip().lower()
-    rag_mode = (
-        RAGPipelineMode(mode_raw)
-        if mode_raw in {m.value for m in RAGPipelineMode}
-        else RAGPipelineMode.TEXT_RETRIEVAL_MLLM
+    rag_mode = _enum_env(
+        "PLANNER_RAG_MODE",
+        RAGPipelineMode,
+        DEFAULTS["PLANNER_RAG_MODE"],
     )
-    strategy_raw = (os.environ.get("TEXT_RETRIEVAL_STRATEGY") or TextRetrievalStrategy.HYBRID.value).strip().lower()
-    text_retrieval_strategy = (
-        TextRetrievalStrategy(strategy_raw)
-        if strategy_raw in {s.value for s in TextRetrievalStrategy}
-        else TextRetrievalStrategy.HYBRID
+    text_retrieval_strategy = _enum_env(
+        "TEXT_RETRIEVAL_STRATEGY",
+        TextRetrievalStrategy,
+        DEFAULTS["TEXT_RETRIEVAL_STRATEGY"],
     )
-
-    text_context_mode = (os.environ.get("TEXT_CONTEXT_MODE") or "metadata").strip().lower()
+    text_context_mode = _str_env("TEXT_CONTEXT_MODE").lower()
     if text_context_mode not in {"none", "metadata"}:
-        text_context_mode = "metadata"
+        text_context_mode = str(DEFAULTS["TEXT_CONTEXT_MODE"])
+
     return Settings(
-        llm_backend=LLMBackend.GEMINI,
-        gemini_model=(os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip(),
-        gemini_api_key=(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip() or None,
-        ollama_base_url=(os.environ.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/"),
-        ollama_model=(os.environ.get("OLLAMA_MODEL") or "llava-phi3:3.8b").strip(),
+        gemini_model=_str_env("GEMINI_MODEL"),
+        gemini_api_key=(os.environ.get("GOOGLE_API_KEY") or "").strip() or None,
         rag_mode=rag_mode,
         text_retrieval_strategy=text_retrieval_strategy,
-        open_clip_model=(os.environ.get("OPEN_CLIP_MODEL") or DEFAULT_OPENCLIP_MODEL).strip(),
-        open_clip_pretrained=(os.environ.get("OPEN_CLIP_PRETRAINED") or DEFAULT_OPENCLIP_PRETRAINED).strip(),
-        text_collection_name=(os.environ.get("TEXT_COLLECTION_NAME") or "text_chunks").strip(),
-        text_bm25_path=(os.environ.get("TEXT_BM25_PATH") or "data/kb/02_index/bm25_corpus.jsonl").strip(),
+        open_clip_model=_str_env("OPEN_CLIP_MODEL"),
+        open_clip_pretrained=_str_env("OPEN_CLIP_PRETRAINED"),
+        text_collection_name=_str_env("TEXT_COLLECTION_NAME"),
+        text_bm25_path=_str_env("TEXT_BM25_PATH"),
         text_context_mode=text_context_mode,
-        dense_k=_int_env("TEXT_DENSE_K", 12),
-        bm25_k=_int_env("TEXT_BM25_K", 12),
-        hybrid_k=_int_env("TEXT_HYBRID_K", 6),
-        rrf_k=_int_env("TEXT_RRF_K", 60),
-        multimodal_fusion_alpha=_float_env("MULTIMODAL_FUSION_ALPHA", 0.7, 0.0, 1.0),
-        multimodal_fusion_k=_int_env("MULTIMODAL_FUSION_K", 8),
-        course_filter_enabled=_bool_env("COURSE_FILTER_ENABLED", True),
-        retrieval_metadata_filter_enabled=_bool_env("RETRIEVAL_METADATA_FILTER_ENABLED", True),
-        debug_trace_enabled=_bool_env("DEBUG_TRACE_ENABLED", False),
-        mllm_max_images=_int_env("MLLM_MAX_IMAGES", 4),
-        mllm_max_image_edge=_int_env("MLLM_MAX_IMAGE_EDGE", 1280),
+        dense_k=_int_env("TEXT_DENSE_K", int(DEFAULTS["TEXT_DENSE_K"])),
+        bm25_k=_int_env("TEXT_BM25_K", int(DEFAULTS["TEXT_BM25_K"])),
+        hybrid_k=_int_env("TEXT_HYBRID_K", int(DEFAULTS["TEXT_HYBRID_K"])),
+        rrf_k=_int_env("TEXT_RRF_K", int(DEFAULTS["TEXT_RRF_K"])),
+        multimodal_fusion_alpha=_float_env(
+            "MULTIMODAL_FUSION_ALPHA",
+            float(DEFAULTS["MULTIMODAL_FUSION_ALPHA"]),
+            0.0,
+            1.0,
+        ),
+        multimodal_fusion_k=_int_env(
+            "MULTIMODAL_FUSION_K",
+            int(DEFAULTS["MULTIMODAL_FUSION_K"]),
+        ),
+        retrieval_metadata_filter_enabled=_bool_env(
+            "RETRIEVAL_METADATA_FILTER_ENABLED",
+            bool(DEFAULTS["RETRIEVAL_METADATA_FILTER_ENABLED"]),
+        ),
+        debug_trace_enabled=_bool_env(
+            "DEBUG_TRACE_ENABLED",
+            bool(DEFAULTS["DEBUG_TRACE_ENABLED"]),
+        ),
+        mllm_max_images=_int_env("MLLM_MAX_IMAGES", int(DEFAULTS["MLLM_MAX_IMAGES"])),
+        mllm_max_image_edge=_int_env(
+            "MLLM_MAX_IMAGE_EDGE",
+            int(DEFAULTS["MLLM_MAX_IMAGE_EDGE"]),
+        ),
     )
