@@ -120,17 +120,13 @@ RETRIEVAL_METADATA_FILTER_ENABLED=1 python planner_agent.py
 
 ## Evaluation
 
-Self-test the evaluation utilities:
+Run the full benchmark (all cases and all variants):
 
 ```bash
-python eval/run_benchmark.py --self-test
+python eval/run_benchmark.py
 ```
 
-Run a smoke benchmark:
-
-```bash
-python eval/run_benchmark.py --smoke
-```
+`make run-eval` does the same, but sets `EVAL_JUDGE_MODEL` from the Makefile `JUDGE_MODEL` variable (default `gpt-4.1-mini`, matching the script default).
 
 Run one variant:
 
