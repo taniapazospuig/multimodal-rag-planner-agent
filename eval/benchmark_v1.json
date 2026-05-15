@@ -6,9 +6,9 @@
       "id": "summarize-key-ideas-lecture",
       "family": "factual",
       "turns": ["Summarize the key ideas of lecture 3 in high dimensional data week 3."],
-      "gold_documents": ["doc_063"],
+      "gold_documents": ["doc_063", "doc_067"],
       "expected_tools_suggested": ["kb_course_retrieval"],
-      "rubric_hints": ["Answer must mention scaling laws, Self-Supervised Learning, and DINO."]
+      "rubric_hints": ["Answer must mention at least one of the following: scaling laws, Self-Supervised Learning, or DINO."]
     },
     {
       "id": "assignment-due-date-generative-ai",
@@ -24,7 +24,7 @@
       "turns": ["Give me tips for habit formation based on all the habit formation research papers in the external knowledge KB"],
       "gold_documents": ["doc_158", "doc_159"],
       "expected_tools_suggested": ["kb_external_research_retrieval"],
-      "rubric_hints": ["Answer should mention several of the following tips: to start with small, simple actions, link the habit to a consistent cue, practice in the morning, select habits you personally value, be realistic about the timeline, focus on consistency and not perfection, use planning and monitoring tools, and focus on adding not subtracting."]
+      "rubric_hints": ["Answer should mention at least one of the following tips: to start with small, simple actions, link the habit to a consistent cue, practice in the morning, select habits you personally value, be realistic about the timeline, focus on consistency and not perfection, use planning and monitoring tools, or focus on adding not subtracting."]
     },
     {
       "id": "suggest-study-environment-group-project",
@@ -33,16 +33,16 @@
       "gold_documents": ["doc_193"],
       "gold_environment_ids_optional": ["env_07"],
       "expected_tools_suggested": ["recommend_study_environment"],
-      "rubric_hints": ["Answer should mention env_07 (common study lounge) and justify why it's a good fit for the request."]
+      "rubric_hints": ["Answer should mention env_07 (common study lounge) and argue that it's a good fit because it has sofas and large windows that let in natural light."]
     },
     {
       "id": "assess-study-environment-fit-common-room",
       "family": "cross_modal",
-      "turns": ["Is the common room a good place to do deep problem solving? My priority is comfortable seating and good lighting."],
+      "turns": ["Is the common room a good place to do administrative tasks if my priority is comfortable seating?"],
       "gold_documents": ["doc_171"],
       "gold_environment_ids_optional": ["env_04"],
       "expected_tools_suggested": ["assess_study_environment_fit"],
-      "rubric_hints": ["Agent should answer no, because the common room has uncomfortable stools and it can be prone to distractions."]
+      "rubric_hints": ["Agent should answer no, explicitly stating that the common room has uncomfortable seatings/stools."]
     },
     {
       "id": "explain-key-ideas-diagram-dino",
@@ -51,31 +51,36 @@
       "gold_documents": ["doc_069"],
       "gold_environment_ids_optional": [],
       "expected_tools_suggested": ["kb_course_retrieval"],
-      "rubric_hints": ["Answer should mention the framework where a student network is trained to match the output of a teacher network that is updated via a moving average of the student's weights. To overcome the computational limits of standard contrastive learning, the architecture utilizes a large set of N prototypes (65536 by default) to mimic a large batch size, allowing the model to compare a single image representation to a vast array of others simultaneously. A stop-gradient operation is applied to the teacher branch to ensure it provides a stable target for the student, preventing the representations from collapsing into a trivial solution."]
+      "rubric_hints": [
+        "Answer should explain that DINO trains a student network to match the outputs of a teacher network in a self-supervised way.",
+        "The teacher should be described as providing stable targets, often via a moving-average update.",
+        "The response should mention that the framework learns meaningful representations while avoiding collapse/trivial solutions.",
+        "The answer should mention at least one of the following details: prototypes, stop-gradient, and mimicking a large batch size."
+      ]
     },
     {
       "id": "estimate-duration-suggest-environment-assignment1-generative-ai",
       "family": "multi_hop",
-      "turns": ["Estimate the duration to complete the code and the report of assignment 1 of generative AI and justify your answer. Then, suggest a study environment to work on the assignment."],
+      "turns": ["Estimate the duration to complete assignment 1 of generative AI and justify your answer. Then, suggest a good indoor study environment to work on the assignment."],
       "gold_documents": ["doc_001", "doc_003", "doc_002"],
       "expected_tools_suggested": ["estimate_study_duration", "recommend_study_environment"],
-      "rubric_hints": ["Duration should be around 6-10 hours. The study environment should be a quiet room like the private study room or the common study space."]
+      "rubric_hints": ["Duration should be around 6-10 hours. The justification should mention that the assingment involves coding and report writing. The study environment should be the private study room (env_03) or the common study space (env_06)."]
     },
     {
       "id": "estimate-duration-find-free-slot-memorize-lecture-4-hdd",
       "family": "multi_hop",
       "turns": ["Estimate the time to memorize all of lecture 4 of hdd week 4. Then, find a free slot in my schedule on Wednesday of that week to do that."],
-      "gold_documents": ["doc_069", "doc_164"],
+      "gold_documents": ["doc_069", "doc_071", "doc_164"],
       "expected_tools_suggested": ["estimate_study_duration", "find_free_slots"],
-      "rubric_hints": ["Duration should be around 4 hours. A free slot is on Wednesday 18th March from 10:45 to 15:30."]
+      "rubric_hints": ["Duration should be around 4-6 hours. A free slot is on Wednesday 18th March from 10:45 to 15:30."]
     },
     {
       "id": "state-key-modeling-variables-applied-class-example-operations-research",
       "family": "multi_hop",
       "turns": ["State the key modeling variables on the applied class example of operations research week 6. Then, estimate the time to review that example."],
-      "gold_documents": ["doc_132"],
+      "gold_documents": ["doc_132", "doc_133"],
       "expected_tools_suggested": ["kb_course_retrieval", "estimate_study_duration"],
-      "rubric_hints": ["Duration should be around 1 hour. Answer should mention variables Xtp units of product p to make in month t; Stp units of product p to store at the end of month t; Ytp, units of product p to sell in month t. "]
+      "rubric_hints": ["Duration should be around 1-2 hours. Answer should mention at least one of the following variables: Xtp units of product p to make in month t; Stp units of product p to store at the end of month t; Ytp, units of product p to sell in month t."]
     },
     {
       "id": "estimate-duration-revise-material-high-dimensional-data-tutorial-week-5",
@@ -84,7 +89,7 @@
       "gold_documents": ["doc_074"],
       "gold_environment_ids_optional": [],
       "expected_tools_suggested": ["kb_course_retrieval", "estimate_study_duration"],
-      "rubric_hints": ["Duration should be around 2 hours. Answer should mention the architecture of MLLMs, the three strategies for multimodal RAG, basic code to implement MRAG, and MRAG Q&A."]
+      "rubric_hints": ["Answer should mention at least one of the following topics: Multimodal Large Language Models in the context of RAG, the three strategies for multimodal RAG, or basic code to implement MRAG. Duration should be around 1-2 hours."]
     },
     {
       "id": "find-free-slots-wednesday-thursday-week-3",
@@ -98,11 +103,11 @@
     {
       "id": "summarize-lecture-topics-generative-ai-week-2-recommend-outdoor-place",
       "family": "conversational",
-      "turns": ["Summarize generative AI week 2 lecture topics.", "Where's a good outdoor place to revise that material and why?"],
-      "gold_documents": ["doc_009","doc_010","doc_014","doc_013", "doc_168", "doc_169"],
+      "turns": ["Summarize generative AI week 2 lecture topics.", "Where's a good outdoor place to revise that material if I want a proper desk and why?"],
+      "gold_documents": ["doc_009", "doc_010", "doc_014", "doc_013", "doc_168", "doc_169"],
       "gold_environment_ids_optional": ["env_02", "env_01"],
       "expected_tools_suggested": ["kb_course_retrieval", "recommend_study_environment"],
-      "rubric_hints": ["Answer should mention Foundations of Language Modeling, Attention, Transformers, and Text Generation. It should recommend the outdoor courtyard (env_01) because the seating is more comfortable than that of the outdoor lawn (env_02)."]
+      "rubric_hints": ["Answer should mention at least one of the following topics: Foundations of Large Language Modeling, Attention, Transformers, or Text Generation. It should recommend the outdoor courtyard (env_01), explicitly stating that it's the better option because the desk is more suitable for studying than that of the outdoor lawn (env_02)."]
     }
   ]
 }

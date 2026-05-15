@@ -4,14 +4,16 @@
 	ablate-all prep-and-run
 
 # Evaluation knobs (can be overridden on CLI):
-# make run-eval FILTER=1 MODE=text_only
+# make run-eval JUDGE_MODEL=gpt-4.1-mini
 FILTER ?= 1
 MODE ?= text_retrieval_mllm
+JUDGE_MODEL ?= gpt-4.1-mini
+PYTHON ?= python3
 
 help:
 	@echo "Targets:"
 	@echo "  make run                              # run with config.py/.env defaults"
-	@echo "  make run-eval FILTER=1 MODE=..."
+	@echo "  make run-eval JUDGE_MODEL=..."
 	@echo "  make ablate-filter                    # metadata filter on vs off"
 	@echo "  make ablate-multimodal                # text_only vs text_mllm vs multimodal_mllm"
 	@echo "  make ablate-all                       # run all ablations sequentially"
@@ -23,9 +25,9 @@ ingest:
 run:
 	python planner_agent.py
 
-# Parametrized evaluation run. Useful to test one explicit configuration tuple.
+# Run the benchmark suite and write report-ready results under eval/results/.
 run-eval:
-	RETRIEVAL_METADATA_FILTER_ENABLED=$(FILTER) PLANNER_RAG_MODE=$(MODE) python planner_agent.py
+	EVAL_JUDGE_MODEL=$(JUDGE_MODEL) $(PYTHON) eval/run_benchmark.py
 
 # 1) Metadata filter ablation
 run-filter:

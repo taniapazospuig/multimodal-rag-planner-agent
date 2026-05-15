@@ -733,7 +733,7 @@ class CourseRetriever:
     Other callers omit doc allowlists when searching planner or study-environment corpora.
 
     Text evidence always combines dense Chroma retrieval with BM25 via reciprocal rank fusion.
-    RAG_MODE controls whether image retrieval/fusion is applied
+    Settings.rag_mode controls whether image retrieval/fusion is applied
     (multimodal_retrieval_mllm only) or text hits are returned directly.
     Optional course/week metadata filtering is applied via Chroma where and BM25 post-filter.
     """
@@ -807,6 +807,8 @@ class CourseRetriever:
 
     def _dense_search(self, query: str, where: dict[str, Any] | None, n_results: int) -> list[str]:
         """Run dense retrieval against existing Chroma vectors."""
+        if self.collection.count() <= 0:
+            return []
         query_embedding = self.backbone.encode_text([query])[0]
         results = self.collection.query(
             query_embeddings=[query_embedding],
@@ -3894,7 +3896,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     logging.getLogger(__name__).info("PLANNER_RAG_MODE=%s", get_settings().rag_mode.value)
     print(f"[ablation] PLANNER_RAG_MODE={get_settings().rag_mode.value}")
-    print("\nPlanner agent (C1 + C2 + C3 + C4 + C5 + C6) ready. Type 'exit' to quit.\n")
+    print("\nPlanner agent ready. Type 'exit' to quit.\n")
     session_memory: dict[str, Any] = {}
     while True:
         user_text = input("You: ").strip()

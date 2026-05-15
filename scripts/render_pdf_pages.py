@@ -123,6 +123,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if not DOCS_CSV.exists():
+        raise SystemExit(f"documents.csv not found: {DOCS_CSV}")
+
     with DOCS_CSV.open("r", encoding="utf-8", newline="") as f:
         rows = list(csv.DictReader(f))
 

@@ -159,6 +159,11 @@ def iter_records(row: dict[str, str]) -> Iterable[dict[str, str | None]]:
     source_path = PROJECT_ROOT / row["source_path"]
     ext = source_path.suffix.lower()
 
+    if not source_path.exists():
+        fallback = f"[MISSING_SOURCE_FILE] {row['source_path']}"
+        yield emit_record(row, "missing_source", "full_text", fallback, None)
+        return
+
     if method in {"plain_text", "code_text"}:
         text = normalize_text(safe_read_text(source_path))
         if text:
@@ -233,6 +238,9 @@ def iter_records(row: dict[str, str]) -> Iterable[dict[str, str | None]]:
 
 def main() -> None:
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if not DOCS_CSV.exists():
+        raise SystemExit(f"documents.csv not found: {DOCS_CSV}")
 
     with DOCS_CSV.open("r", encoding="utf-8", newline="") as f:
         rows = list(csv.DictReader(f))

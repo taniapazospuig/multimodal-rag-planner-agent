@@ -158,6 +158,7 @@ def main() -> None:
 
     if not candidates:
         print(f"Discovered images: {len(image_paths)}")
+        print(f"Skipped (missing documents.csv metadata): {skipped_missing_metadata}")
         print("Indexed images: 0 (all already present or no matching files)")
         print(f"Collection: {args.collection}")
         print(f"Chroma path: {args.chroma_path}")
