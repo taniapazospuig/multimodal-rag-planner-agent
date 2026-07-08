@@ -4,12 +4,12 @@ Personal study-planning agent with multimodal retrieval over course documents, p
 
 The submitted system supports six planner capabilities:
 
-- C1 CourseQA / TopicSummary over course-content documents.
-- C2 Study-duration estimation from course evidence.
-- C3 Free-slot finding from planner screenshots.
-- C4 Study-environment recommendation.
-- C5 Targeted study-environment fit assessment.
-- C6 ResearchQA over the external-knowledge paper corpus.
+- CourseQA / TopicSummary over course-content documents.
+- Study-duration estimation from course evidence.
+- Free-slot finding from planner screenshots.
+- Study-environment recommendation.
+- Targeted study-environment fit assessment.
+- ResearchQA over the external-knowledge paper corpus.
 
 ## Repository Layout
 
