@@ -1,4 +1,4 @@
-# Personal Multimodal RAG Planner
+# Multimodal RAG Planner Agent
 
 Personal study-planning agent with multimodal retrieval over course documents, planner screenshots, study-location photos, to-do lists, and external research papers. The agent is implemented with LangGraph, OpenAI chat models, OpenCLIP embeddings, ChromaDB vector storage, and BM25 lexical retrieval.
 
